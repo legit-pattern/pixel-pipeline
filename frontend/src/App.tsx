@@ -9,14 +9,12 @@ import {
 } from "react";
 import {
   fetchAssetPresets,
-  fetchCharacterDNA,
   extractPaletteFromFile,
   fetchExportFormats,
   fetchJobs,
   fetchModels,
   fetchPalettes,
   type AssetPreset,
-  type CharacterDNA,
   type ExportFormat,
   type GenerateRequest,
   type JobRecord,
@@ -121,12 +119,8 @@ const DEFAULT_ASSET_PRESETS: AssetPreset[] = [
   { id: "sprite", label: "Sprite" },
   { id: "tile", label: "Tile" },
   { id: "prop", label: "Prop" },
-  { id: "effect", label: "Effect" },
+  { id: "effect", label: "VFX / Effect" },
   { id: "ui", label: "UI" },
-];
-
-const DEFAULT_CHARACTER_DNA: CharacterDNA[] = [
-  { id: "frog_guardian", label: "Frog Guardian" },
 ];
 
 const DEFAULT_PALETTES: PalettePreset[] = [
@@ -185,7 +179,6 @@ type StudioSettings = {
   outputFormat: string;
   modelFamily: string;
   assetPreset: string;
-  characterDnaId: string;
   palettePreset: string;
   paletteSize: number;
   customColors: string[];
@@ -477,7 +470,6 @@ function App() {
   const [models, setModels] = useState<ModelOption[]>(DEFAULT_MODELS);
   const [palettes, setPalettes] = useState<PalettePreset[]>(DEFAULT_PALETTES);
   const [assetPresets, setAssetPresets] = useState<AssetPreset[]>(DEFAULT_ASSET_PRESETS);
-  const [characterDna, setCharacterDna] = useState<CharacterDNA[]>(DEFAULT_CHARACTER_DNA);
   const [formats, setFormats] = useState<ExportFormat[]>(DEFAULT_FORMATS);
 
   const [history, setHistory] = useState<JobRecord[]>(readHistory());
@@ -497,7 +489,6 @@ function App() {
   const [outputFormat, setOutputFormat] = useState<string>(savedSettings.outputFormat ?? "spritesheet_png");
   const [modelFamily, setModelFamily] = useState<string>(savedSettings.modelFamily ?? "pixel_art_diffusion_xl");
   const [assetPreset, setAssetPreset] = useState<string>(savedSettings.assetPreset ?? "auto");
-  const [characterDnaId, setCharacterDnaId] = useState<string>(savedSettings.characterDnaId ?? "");
 
   const [palettePreset, setPalettePreset] = useState<string>(savedSettings.palettePreset ?? "steam_lords");
   const [paletteSize, setPaletteSize] = useState<number>(savedSettings.paletteSize ?? 16);
@@ -592,7 +583,6 @@ function App() {
   const availableModels = models.length > 0 ? models : DEFAULT_MODELS;
   const availablePalettes = palettes.length > 0 ? palettes : DEFAULT_PALETTES;
   const availableAssetPresets = assetPresets.length > 0 ? assetPresets : DEFAULT_ASSET_PRESETS;
-  const availableCharacterDna = characterDna.length > 0 ? characterDna : DEFAULT_CHARACTER_DNA;
   const availableFormats = formats.length > 0 ? formats : DEFAULT_FORMATS;
   const frameScores = useMemo(() => getAnimationFrameScores(jobState.result?.metadata), [jobState.result?.metadata]);
   const sourceAnalysis = useMemo(() => getSourceAnalysis(jobState.result?.metadata), [jobState.result?.metadata]);
@@ -729,7 +719,6 @@ function App() {
       outputFormat,
       modelFamily,
       assetPreset,
-      characterDnaId,
       palettePreset,
       paletteSize,
       customColors,
@@ -789,7 +778,6 @@ function App() {
     outputFormat,
     modelFamily,
     assetPreset,
-    characterDnaId,
     palettePreset,
     paletteSize,
     customColors,
@@ -893,21 +881,18 @@ function App() {
       fetchModels(),
       fetchPalettes(),
       fetchAssetPresets(),
-      fetchCharacterDNA(),
       fetchExportFormats(),
     ])
-      .then(([m, p, ap, dna, f]) => {
+      .then(([m, p, ap, f]) => {
         setModels(m.length ? m : DEFAULT_MODELS);
         setPalettes(p.length ? p : DEFAULT_PALETTES);
         setAssetPresets(ap.length ? ap : DEFAULT_ASSET_PRESETS);
-        setCharacterDna(dna.length ? dna : DEFAULT_CHARACTER_DNA);
         setFormats(f.length ? f : DEFAULT_FORMATS);
       })
       .catch(() => {
         setModels(DEFAULT_MODELS);
         setPalettes(DEFAULT_PALETTES);
         setAssetPresets(DEFAULT_ASSET_PRESETS);
-        setCharacterDna(DEFAULT_CHARACTER_DNA);
         setFormats(DEFAULT_FORMATS);
       });
   }, []);
@@ -1097,7 +1082,7 @@ function App() {
       output_format: outputFormat,
       ephemeral_output: isGithubPagesFrontend,
       asset_preset: assetPreset,
-      character_dna_id: characterDnaId || null,
+      character_dna_id: null,
       model_family: modelFamily,
       source_image_base64: sourceImageBase64,
       // Phase 1: Input conditioning
@@ -1422,7 +1407,7 @@ function App() {
             </div>
 
             <label>
-              Style profile
+              Model profile
               <select value={modelFamily} onChange={(e) => setModelFamily(e.target.value)}>
                 {availableModels.map((model) => (
                   <option key={model.id} value={model.id}>
@@ -1435,31 +1420,20 @@ function App() {
               PAD-XL SpriteShaper is now the active foundation. Choose one profile/checkpoint per run; profiles are not combined automatically.
             </p>
 
-            <div className="inline-grid two">
-              <label>
-                Asset preset
-                <select value={assetPreset} onChange={(e) => setAssetPreset(e.target.value)}>
-                  <option value="auto">Auto (from lane)</option>
-                  {availableAssetPresets.map((preset) => (
-                    <option key={preset.id} value={preset.id}>
-                      {preset.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Character DNA
-                <select value={characterDnaId} onChange={(e) => setCharacterDnaId(e.target.value)}>
-                  <option value="">None</option>
-                  {availableCharacterDna.map((dna) => (
-                    <option key={dna.id} value={dna.id}>
-                      {dna.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
+            <label>
+              Asset type
+              <select value={assetPreset} onChange={(e) => setAssetPreset(e.target.value)}>
+                <option value="auto">Auto (from lane)</option>
+                {availableAssetPresets.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="muted">
+              Auto follows selected lane. Use VFX / Effect for particles, spell hits, smoke, sparks, and similar non-character assets.
+            </p>
 
             <label>
               Prompt *
@@ -1471,9 +1445,9 @@ function App() {
             </p>
 
             <div className="template-row">
-              <button onClick={applyStarterPromptForSelection}>Use lane starter prompt</button>
-              <button onClick={() => setTemplate("hero")}>Character template</button>
-              <button onClick={() => setTemplate("frog")}>Enemy sheet template</button>
+              <button onClick={applyStarterPromptForSelection}>Apply starter prompt</button>
+              <button onClick={() => setTemplate("hero")}>Character prompt</button>
+              <button onClick={() => setTemplate("frog")}>Enemy prompt</button>
             </div>
 
             <label>
@@ -1508,7 +1482,7 @@ function App() {
               </label>
 
               <label>
-                Download as
+                Primary export format
                 <select value={outputFormat} onChange={(e) => setOutputFormat(e.target.value)}>
                   {availableFormats.map((format) => (
                     <option key={format.id} value={format.id}>
@@ -1527,7 +1501,7 @@ function App() {
             </div>
 
             <div className="subpanel">
-              <h3>Colors</h3>
+              <h3>Palette</h3>
 
               <div className="palette-upload-row">
                 <label className="palette-upload-label">
@@ -1628,7 +1602,7 @@ function App() {
             </div>
 
             <div className="subpanel">
-              <h3>Sheet</h3>
+              <h3>Frame sheet</h3>
               <div className="inline-grid five">
                 <label>
                   W
@@ -2254,7 +2228,7 @@ function App() {
                   <p className={`status-value status-${item.status}`}>{item.status}</p>
                   <div className="download-grid">
                     {downloadLink("PNG", item.result?.download?.png_url)}
-                    {downloadLink("Sheet", item.result?.download?.spritesheet_png_url)}
+                    {downloadLink("Sprite Sheet", item.result?.download?.spritesheet_png_url)}
                     {downloadLink("JSON", item.result?.download?.metadata_url)}
                   </div>
                 </article>

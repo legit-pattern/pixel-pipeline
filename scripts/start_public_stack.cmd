@@ -49,5 +49,7 @@ echo Open the "pixel-tunnel" window and copy the https://...trycloudflare.com UR
 echo Then set/update GitHub repository variable VITE_API_BASE_URL with that URL.
 echo.
 echo Frontend URL: https://legit-pattern.github.io/pixel-pipeline/
+echo [INFO] Note: GitHub Pages frontend can be behind local UI changes.
+echo [INFO] For latest local frontend code, run scripts\start_pixel_studio.sh and open http://127.0.0.1:5173.
 
 endlocal
