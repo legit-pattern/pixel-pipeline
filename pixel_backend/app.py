@@ -1765,14 +1765,11 @@ def _run_generation(record: JobRecord) -> None:
         job_dir.mkdir(exist_ok=True)
         log.info("Job %s output dir: %s", record.job_id, job_dir)
 
-    # SDXL on CPU is unstable/heavy on many Windows setups and can crash the process.
-    # Default behavior is to fail the job gracefully and keep the API alive.
-    if not torch.cuda.is_available() and not _env_flag("PIXEL_BACKEND_ALLOW_CPU_SDXL", False):
+    # Enforce GPU-only execution for SDXL generation.
+    if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA/GPU is not available on this host. "
-            "SDXL model loading is disabled to prevent backend crashes. "
-            "Run on a CUDA-enabled environment, or set PIXEL_BACKEND_ALLOW_CPU_SDXL=1 "
-            "to force CPU mode (at your own risk)."
+            "SDXL model loading requires a CUDA-enabled environment."
         )
 
     t_pipe = time.perf_counter()

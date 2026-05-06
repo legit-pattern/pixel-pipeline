@@ -18,10 +18,6 @@ if "%BACKEND_PORT%"=="" set "BACKEND_PORT=48617"
 cd /d "%ROOT_DIR%"
 set "PIXEL_BACKEND_CORS_ORIGINS=%PAGES_ORIGIN%"
 
-rem TEMPORARY: CPU fallback while CUDA PyTorch is installing.
-rem Remove this line once pip finishes and "CUDA available: True" is confirmed.
-set "PIXEL_BACKEND_ALLOW_CPU_SDXL=1"
-
 if exist "%ROOT_DIR%\.venv\Scripts\python.exe" (
   echo [INFO] Using venv python: %ROOT_DIR%\.venv\Scripts\python.exe
   "%ROOT_DIR%\.venv\Scripts\python.exe" -m pixel_backend --host %BACKEND_HOST% --port %BACKEND_PORT%
