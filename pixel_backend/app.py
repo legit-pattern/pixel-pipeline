@@ -106,6 +106,13 @@ def _configure_logging() -> None:
     _LOGGING_CONFIGURED = True
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class PaletteInput(BaseModel):
     preset: str = "custom"
     size: int = 16
@@ -439,6 +446,57 @@ def _reframe_image(
             "reframed_width": image.size[0],
             "reframed_height": image.size[1],
         }
+
+
+def _apply_source_processing(
+    image: PIL.Image.Image,
+    request: GenerateRequest,
+) -> tuple[PIL.Image.Image, SourceAnalysis | None]:
+    """Apply request-driven source conditioning and return processed image + analysis."""
+    mode = request.source_processing_mode.strip().lower()
+    if mode == "none":
+        return image, None
+
+    processing_applied: list[str] = []
+    original_width, original_height = image.size
+    processed = image
+
+    detect = _detect_pixel_art(processed)
+    processing_applied.append("detect")
+    source_analysis: dict[str, Any] = {
+        "is_pixel_art": bool(detect.get("is_pixel_art", False)),
+        "detected_palette_size": int(detect.get("detected_palette_size", 256)),
+        "processing_applied": processing_applied,
+    }
+
+    if mode == "pixelate":
+        # Tie target width to requested frame width so source conditioning matches job intent.
+        processed = _pixelate_image(processed, target_width=max(8, request.sheet.frame_width))
+        processing_applied.append("pixelate")
+
+    if mode == "reframe":
+        reframed, bounds = _reframe_image(
+            processed,
+            scale_x=request.reframe.canvas_scale_x,
+            scale_y=request.reframe.canvas_scale_y,
+            fill_mode=request.reframe.fill_mode,
+            anchor_x=request.reframe.anchor_x,
+            anchor_y=request.reframe.anchor_y,
+        )
+        processed = reframed
+        processing_applied.append("reframe")
+        if request.reframe.preserve_bounds:
+            source_analysis["original_bounds"] = {
+                "width": int(bounds.get("original_width", original_width)),
+                "height": int(bounds.get("original_height", original_height)),
+            }
+            source_analysis["reframed_bounds"] = {
+                "width": int(bounds.get("reframed_width", processed.width)),
+                "height": int(bounds.get("reframed_height", processed.height)),
+            }
+
+    source_analysis["processing_applied"] = processing_applied
+    return processed, SourceAnalysis(**source_analysis)
 
 
 def _validate_generate_request(request: GenerateRequest) -> None:
@@ -1668,6 +1726,18 @@ def _run_generation(record: JobRecord) -> None:
 
     req = record.request
     t_job = time.perf_counter()
+    timing: dict[str, Any] = {
+        "source_decode_s": 0.0,
+        "source_processing_s": 0.0,
+        "pipeline_load_s": 0.0,
+        "inference_s": 0.0,
+        "inference_mode": "txt2img",
+        "post_processing_s": 0.0,
+        "save_outputs_s": 0.0,
+        "total_s": 0.0,
+        "cuda_peak_allocated_mb": None,
+        "cuda_peak_reserved_mb": None,
+    }
     log.info(
         "Job %s start | model=%s lane=%s mode=%s format=%s",
         record.job_id,
@@ -1680,7 +1750,19 @@ def _run_generation(record: JobRecord) -> None:
     job_dir.mkdir(exist_ok=True)
     log.info("Job %s output dir: %s", record.job_id, job_dir)
 
+    # SDXL on CPU is unstable/heavy on many Windows setups and can crash the process.
+    # Default behavior is to fail the job gracefully and keep the API alive.
+    if not torch.cuda.is_available() and not _env_flag("PIXEL_BACKEND_ALLOW_CPU_SDXL", False):
+        raise RuntimeError(
+            "CUDA/GPU is not available on this host. "
+            "SDXL model loading is disabled to prevent backend crashes. "
+            "Run on a CUDA-enabled environment, or set PIXEL_BACKEND_ALLOW_CPU_SDXL=1 "
+            "to force CPU mode (at your own risk)."
+        )
+
+    t_pipe = time.perf_counter()
     pipe = _load_pipeline(req.model_family)
+    timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
     palette_ctx = _resolve_palette_context(req.palette)
     palette_colors: list[str] = palette_ctx["colors"]
     palette_name: str = str(palette_ctx["label"])
@@ -1730,16 +1812,30 @@ def _run_generation(record: JobRecord) -> None:
 
     # ── source image for img2img (optional, with safe fallback) ───────────────
     init_image: Image.Image | None = None
+    source_analysis: SourceAnalysis | None = None
     if req.source_image_base64:
         t_decode = time.perf_counter()
         raw = base64.b64decode(req.source_image_base64)
         init_image = Image.open(io.BytesIO(raw)).convert("RGBA")
+        timing["source_decode_s"] = round(time.perf_counter() - t_decode, 4)
         log.info(
             "Job %s source image decoded in %.2fs (%dx%d)",
             record.job_id,
-            time.perf_counter() - t_decode,
+            timing["source_decode_s"],
             init_image.width,
             init_image.height,
+        )
+
+        t_source = time.perf_counter()
+        processed_source, source_analysis = _apply_source_processing(init_image.convert("RGB"), req)
+        init_image = processed_source.convert("RGBA")
+        timing["source_processing_s"] = round(time.perf_counter() - t_source, 4)
+        log.info(
+            "Job %s source processing in %.2fs | mode=%s steps=%s",
+            record.job_id,
+            timing["source_processing_s"],
+            req.source_processing_mode,
+            source_analysis.processing_applied if source_analysis else [],
         )
 
     # ── determine output size ─────────────────────────────────────────────────
@@ -1764,6 +1860,12 @@ def _run_generation(record: JobRecord) -> None:
 
     import torch
     generator = torch.Generator(device=pipe.device.type)
+    if torch.cuda.is_available() and pipe.device.type == "cuda":
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            # Keep generation resilient if memory stats are unavailable.
+            pass
     # seed=-1 means random; any other value is used directly for reproducibility
     actual_seed = req.seed if req.seed >= 0 else int(time.time()) & 0xFFFFFFFF
     generator.manual_seed(actual_seed)
@@ -1817,7 +1919,9 @@ def _run_generation(record: JobRecord) -> None:
             }
             img2img_kwargs = _with_progress_callbacks(img2img.__call__, img2img_kwargs)
             result_img = img2img(**img2img_kwargs).images[0]
-            log.info("Job %s img2img finished in %.2fs", record.job_id, time.perf_counter() - t_img2img)
+            timing["inference_s"] = round(time.perf_counter() - t_img2img, 4)
+            timing["inference_mode"] = "img2img"
+            log.info("Job %s img2img finished in %.2fs", record.job_id, timing["inference_s"])
         except Exception as exc:
             log.warning("Img2img fallback to txt2img for job %s: %s", record.job_id, exc)
 
@@ -1835,10 +1939,14 @@ def _run_generation(record: JobRecord) -> None:
         }
         txt2img_kwargs = _with_progress_callbacks(pipe.__call__, txt2img_kwargs)
         result_img = pipe(**txt2img_kwargs).images[0]
-        log.info("Job %s txt2img finished in %.2fs", record.job_id, time.perf_counter() - t_txt2img)
+        timing["inference_s"] = round(time.perf_counter() - t_txt2img, 4)
+        timing["inference_mode"] = "txt2img"
+        log.info("Job %s txt2img finished in %.2fs", record.job_id, timing["inference_s"])
 
     # ── post-processing (optional, all opt-in) ────────────────────────────────
+    t_post = time.perf_counter()
     result_img = _apply_post_processing(result_img, req, effective_pp, palette_colors, palette_ctx["profile"])
+    timing["post_processing_s"] = round(time.perf_counter() - t_post, 4)
     effective_pixelate = bool(effective_pp.get("pixelate", False) or req.auto_pipeline)
     effective_quantize = bool(effective_pp.get("quantize_palette", False) or (
         req.auto_pipeline and bool(palette_colors)
@@ -1963,9 +2071,21 @@ def _run_generation(record: JobRecord) -> None:
             "aligned": {"width": gen_w, "height": gen_h},
         },
     }
+    if source_analysis is not None:
+        metadata["source_analysis"] = source_analysis.model_dump()
     meta_path = job_dir / "metadata.json"
+    timing["save_outputs_s"] = round(time.perf_counter() - t_save, 4)
+    timing["total_s"] = round(time.perf_counter() - t_job, 4)
+    if torch.cuda.is_available() and pipe.device.type == "cuda":
+        try:
+            timing["cuda_peak_allocated_mb"] = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 2)
+            timing["cuda_peak_reserved_mb"] = round(torch.cuda.max_memory_reserved() / (1024 * 1024), 2)
+        except Exception:
+            timing["cuda_peak_allocated_mb"] = None
+            timing["cuda_peak_reserved_mb"] = None
+    metadata["timing"] = timing
     meta_path.write_text(json.dumps(metadata, indent=2))
-    log.info("Job %s files saved in %.2fs", record.job_id, time.perf_counter() - t_save)
+    log.info("Job %s files saved in %.2fs", record.job_id, timing["save_outputs_s"])
 
     base = f"/outputs/{record.job_id}"
     image_url_by_format = {
@@ -1990,7 +2110,8 @@ def _run_generation(record: JobRecord) -> None:
         },
         "metadata": metadata,
     }
-    log.info("Job %s complete in %.2fs", record.job_id, time.perf_counter() - t_job)
+    _record_generation_metrics(record.job_id, req, timing)
+    log.info("Job %s complete in %.2fs", record.job_id, timing["total_s"])
 
 
 def _get_installed_version(package_name: str) -> str | None:
@@ -2002,6 +2123,25 @@ def _get_installed_version(package_name: str) -> str | None:
 
 # ── startup self-checks (phase 0.2) ────────────────────────────────────────────
 _STARTUP_CHECKS_CACHE: dict[str, Any] | None = None
+_GENERATION_METRICS_CACHE: dict[str, Any] = {
+    "last_job": None,
+    "recent_jobs": [],
+}
+
+
+def _record_generation_metrics(job_id: str, req: GenerateRequest, timing: dict[str, Any]) -> None:
+    entry = {
+        "job_id": job_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model_family": req.model_family,
+        "lane": req.lane,
+        "output_mode": req.output_mode,
+        "timing": timing,
+    }
+    _GENERATION_METRICS_CACHE["last_job"] = entry
+    recent = _GENERATION_METRICS_CACHE.setdefault("recent_jobs", [])
+    recent.insert(0, entry)
+    del recent[10:]
 
 
 def _validate_checkpoint_accessibility() -> dict[str, Any]:
@@ -2162,6 +2302,7 @@ def _runtime_diagnostics() -> dict[str, Any]:
             "cuda_device_count": 0,
         },
         "startup_checks": _STARTUP_CHECKS_CACHE,
+        "generation_metrics": _GENERATION_METRICS_CACHE,
     }
 
     if torch_spec is None:
@@ -2209,6 +2350,13 @@ def _run_job(record: JobRecord) -> None:
         record.status = "pending"
         log.info("Job %s entered runner", record.job_id)
         _run_generation(record)
+        if record.cancelled and record.status != "failure":
+            # If cancellation is requested while generation is running,
+            # cancellation wins over success for deterministic terminal state.
+            record.status = "cancelled"
+            record.result = None
+            record.error = None
+            log.info("Job %s marked cancelled after generation return", record.job_id)
     except Exception as exc:
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
