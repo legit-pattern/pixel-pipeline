@@ -61,7 +61,8 @@ _LORA_MAP: dict[str, str] = {
 _BASE_MODEL_CHECKPOINTS: dict[str, str] = {
     "sdxl_base": "pixelArtDiffusionXL_spriteShaper.safetensors",
     "pixel_art_diffusion_xl": "pixelArtDiffusionXL_spriteShaper.safetensors",
-    "sdxl_base_legacy": "sd_xl_base_1.0.safetensors",
+    # Backward-compat alias: keep id valid, but pin it to the active PAD-XL checkpoint.
+    "sdxl_base_legacy": "pixelArtDiffusionXL_spriteShaper.safetensors",
 }
 
 _ALLOWED_OUTPUT_FORMATS = {"png", "webp", "gif", "spritesheet_png"}
@@ -2428,11 +2429,6 @@ def create_app() -> FastAPI:
                 "id": "pixel_art_diffusion_xl",
                 "label": "Pixel Art Diffusion XL SpriteShaper ★ Recommended",
                 "quality": "pixel-checkpoint",
-            },
-            {
-                "id": "sdxl_base_legacy",
-                "label": "SDXL Base 1.0 (legacy checkpoint)",
-                "quality": "balanced",
             },
             # ── sdxl_base + pixel-art LoRAs ─────────────────────────────────────
             {

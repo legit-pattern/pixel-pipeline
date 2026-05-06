@@ -48,7 +48,6 @@ const DEFAULT_MODELS: ModelOption[] = [
     quality: "pixel-checkpoint",
   },
   { id: "sdxl_base", label: "PAD-XL SpriteShaper (active base)", quality: "pixel-checkpoint" },
-  { id: "sdxl_base_legacy", label: "SDXL Base 1.0 (legacy checkpoint)", quality: "balanced" },
   { id: "sdxl_pixel_art", label: "SDXL Base + 64x64 Pixel Art LoRA", quality: "pixel-optimized" },
   { id: "sdxl_swordsman", label: "SDXL + Swordsman LoRA", quality: "character-optimized" },
   { id: "sdxl_jinja_shrine", label: "SDXL + Jinja Shrine Zen LoRA", quality: "environment-optimized" },
@@ -714,7 +713,7 @@ function App() {
       return;
     }
 
-    setModelFamily("sdxl_base_legacy");
+    setModelFamily("sdxl_base");
     setPalettePreset("custom");
     setPaletteSize(24);
     setAutoPipeline(false);
