@@ -61,8 +61,6 @@ _LORA_MAP: dict[str, str] = {
 _BASE_MODEL_CHECKPOINTS: dict[str, str] = {
     "sdxl_base": "pixelArtDiffusionXL_spriteShaper.safetensors",
     "pixel_art_diffusion_xl": "pixelArtDiffusionXL_spriteShaper.safetensors",
-    # Backward-compat alias: keep id valid, but pin it to the active PAD-XL checkpoint.
-    "sdxl_base_legacy": "pixelArtDiffusionXL_spriteShaper.safetensors",
 }
 
 _ALLOWED_OUTPUT_FORMATS = {"png", "webp", "gif", "spritesheet_png"}
