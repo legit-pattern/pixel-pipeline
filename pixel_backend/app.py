@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -2420,6 +2420,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Pixel Studio Backend", version="0.1.0")
 
     cors_origins_raw = os.getenv("PIXEL_BACKEND_CORS_ORIGINS", "").strip()
+    allow_origins: list[str] = []
     if cors_origins_raw:
         allow_origins = [item.strip() for item in cors_origins_raw.split(",") if item.strip()]
         if allow_origins:
@@ -2431,6 +2432,37 @@ def create_app() -> FastAPI:
                 allow_headers=["*"],
             )
             log.info("CORS enabled for %d origin(s)", len(allow_origins))
+
+    allowed_origin_set = set(allow_origins)
+
+    @app.middleware("http")
+    async def explicit_cors_headers(request: Request, call_next):
+        """Ensure CORS headers are consistently returned for allowed origins.
+
+        Some clients and tunnel/proxy combinations may expose stricter behavior
+        around preflight responses. This middleware guarantees that allowed
+        origins receive explicit CORS headers and a 204 preflight response.
+        """
+        origin = request.headers.get("origin")
+        origin_allowed = bool(origin and origin in allowed_origin_set)
+        is_preflight = (
+            request.method.upper() == "OPTIONS"
+            and bool(request.headers.get("access-control-request-method"))
+        )
+
+        if is_preflight and origin_allowed:
+            response = Response(status_code=204)
+        else:
+            response = await call_next(request)
+
+        if origin_allowed:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            requested_headers = request.headers.get("access-control-request-headers")
+            response.headers["Access-Control-Allow-Headers"] = requested_headers or "*"
+
+        return response
 
     # Serve generated images at /outputs/<job_id>/<file>
     app.mount("/outputs", StaticFiles(directory=str(_OUTPUT_DIR)), name="outputs")
