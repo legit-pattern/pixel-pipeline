@@ -11,7 +11,6 @@ import {
   fetchAssetPresets,
   extractPaletteFromFile,
   fetchExportFormats,
-  fetchJobs,
   fetchModels,
   fetchPalettes,
   type AssetPreset,
@@ -474,8 +473,6 @@ function App() {
   const [formats, setFormats] = useState<ExportFormat[]>(DEFAULT_FORMATS);
 
   const [history, setHistory] = useState<JobRecord[]>(readHistory());
-  const [libraryJobs, setLibraryJobs] = useState<JobRecord[]>([]);
-  const [libraryLoading, setLibraryLoading] = useState<boolean>(false);
   const [starredIds, setStarredIds] = useState<string[]>(readStarred());
 
   const [search, setSearch] = useState<string>(savedSettings.search ?? "");
@@ -574,7 +571,6 @@ function App() {
   const handleJobUpdate = useCallback(
     (patch: Pick<JobRecord, "job_id" | "status" | "result" | "error">) => {
       setHistory((prev) => applyJobPatch(prev, patch));
-      setLibraryJobs((prev) => applyJobPatch(prev, patch));
     },
     [],
   );
@@ -925,22 +921,6 @@ function App() {
   }, [availablePalettes, palettePreset]);
 
   useEffect(() => {
-    if (tab !== "library") {
-      return;
-    }
-
-    const controller = new AbortController();
-    Promise.resolve().then(() => setLibraryLoading(true));
-
-    void fetchJobs({ search, signal: controller.signal })
-      .then((jobs) => setLibraryJobs(jobs))
-      .catch(() => setLibraryJobs([]))
-      .finally(() => setLibraryLoading(false));
-
-    return () => controller.abort();
-  }, [tab, search]);
-
-  useEffect(() => {
     if (!editorGridInitializedRef.current) {
       editorGridInitializedRef.current = true;
       return;
@@ -1155,6 +1135,19 @@ function App() {
     );
   }
 
+  function removeLibraryItem(jobId: string) {
+    setHistory((prev) => prev.filter((item) => item.job_id !== jobId));
+    setStarredIds((prev) => prev.filter((id) => id !== jobId));
+  }
+
+  function clearLibrary() {
+    if (!window.confirm("Delete all items from your local library?")) {
+      return;
+    }
+    setHistory([]);
+    setStarredIds([]);
+  }
+
   function setPixelAt(clientX: number, clientY: number, erase: boolean) {
     const canvas = canvasRef.current;
     if (!canvas) {
@@ -1286,9 +1279,7 @@ function App() {
   const filteredHistory = useMemo(() => {
     const needle = search.trim().toLowerCase();
 
-    const source = libraryJobs.length > 0 ? libraryJobs : history;
-
-    return source.filter((item) => {
+    return history.filter((item) => {
       if (filter === "starred" && !starredIds.includes(item.job_id)) {
         return false;
       }
@@ -1302,7 +1293,7 @@ function App() {
         item.request.lane.toLowerCase().includes(needle)
       );
     });
-  }, [libraryJobs, history, search, filter, starredIds]);
+  }, [history, search, filter, starredIds]);
 
   function downloadLink(label: string, url?: string) {
     const disabled = !url;
@@ -2225,10 +2216,9 @@ function App() {
                 <button className={filter === "starred" ? "active" : ""} onClick={() => setFilter("starred")}>
                   Starred
                 </button>
+                <button onClick={clearLibrary}>Clear all</button>
               </div>
             </div>
-
-            {libraryLoading && <p className="muted">Syncing jobs...</p>}
 
             <div className="library-grid">
               {filteredHistory.map((item) => (
@@ -2240,6 +2230,7 @@ function App() {
                     <button className="star" onClick={() => toggleStar(item.job_id)}>
                       {starredIds.includes(item.job_id) ? "★" : "☆"}
                     </button>
+                    <button onClick={() => removeLibraryItem(item.job_id)}>Delete</button>
                   </div>
                   <p className="library-prompt">{item.request.prompt}</p>
                   <p className="library-meta">
