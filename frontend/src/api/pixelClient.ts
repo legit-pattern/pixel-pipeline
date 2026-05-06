@@ -242,10 +242,25 @@ function resolveBackendUrl(value: string | undefined): string | undefined {
   if (!value) {
     return value;
   }
-  if (/^https?:\/\//i.test(value)) {
-    return value;
+  const normalized = value.trim();
+
+  // Ephemeral output may return inline data/blob URLs; keep them as-is.
+  if (/^(https?:\/\/|data:|blob:)/i.test(normalized)) {
+    return normalized;
   }
-  return apiUrl(value);
+
+  // Some older clients/storage states may hold URL-encoded schemes such as
+  // "data%3Aimage/..." (sometimes slash-prefixed as "/data%3A...").
+  const encodedScheme = normalized.replace(/^\/+/, "");
+  if (/^(data%3a|blob%3a|https?%3a%2f%2f)/i.test(encodedScheme)) {
+    try {
+      return decodeURIComponent(encodedScheme);
+    } catch {
+      // Fall back to backend URL resolution below if decode fails.
+    }
+  }
+
+  return apiUrl(normalized);
 }
 
 function normalizeJobResult(result: JobResult | undefined): JobResult | undefined {
