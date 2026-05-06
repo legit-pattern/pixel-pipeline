@@ -1,0 +1,9 @@
+{
+  "name": "pixel-pipeline",
+  "version": "0.0.0",
+  "scripts": {
+    "start": "py -3 -m pixel_backend",
+    "start:backend": "py -3 -m pixel_backend",
+    "dev": "py -3 -m pixel_backend --reload"
+  }
+}

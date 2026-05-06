@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "product": "pixel-studio",
+  "goal": "pixel-art-first asset pipeline",
+  "model_families": {
+    "lookdev_generalist": {
+      "role": "early silhouette and motif exploration",
+      "recommended": [
+        "Illustrious XL",
+        "DreamShaper XL Lightning"
+      ],
+      "notes": [
+        "Use for exploration only, not final pixel masters.",
+        "Prioritize readable silhouettes and costume blocks over texture detail."
+      ]
+    },
+    "pixel_master": {
+      "role": "final pixel-native generation",
+      "recommended": [
+        "PixelWave-style SDXL checkpoint",
+        "Pixel-native Illustrious or SDXL sprite checkpoint"
+      ],
+      "notes": [
+        "This is the main family to benchmark first.",
+        "Reject any checkpoint that cannot keep clean clusters after downscale.",
+        "Do not replace this family with DreamShaper for final production."
+      ]
+    },
+    "ui_or_tiles_specialist": {
+      "role": "optional second pixel checkpoint for ui modules and tile kits",
+      "recommended": [
+        "Second pixel-native checkpoint tuned for icons, tiles, or low-noise sprites"
+      ],
+      "notes": [
+        "Only keep this lane if it materially beats the main pixel master on tileability or anti-text behavior.",
+        "If it does not clearly win, delete it and keep one pixel master family."
+      ]
+    }
+  },
+  "loras": {
+    "policy": "minimal",
+    "rules": [
+      "Do not default to global LoRA stacks.",
+      "Use at most one verified lane-specific LoRA in the first benchmark pass.",
+      "Avoid grain, detail, painterly, and cinematic LoRAs in final pixel passes."
+    ],
+    "targets": [
+      "optional outline cleanup LoRA",
+      "optional SNES or JRPG palette bias LoRA",
+      "optional UI module LoRA"
+    ]
+  },
+  "evaluation": {
+    "lanes": [
+      "sprite",
+      "world",
+      "prop",
+      "ui",
+      "portrait"
+    ],
+    "checks": [
+      "cluster integrity at 1x",
+      "palette discipline",
+      "pose and framing stability",
+      "tileability or orthographic consistency",
+      "pseudo-text suppression",
+      "downscale survival"
+    ]
+  },
+  "export": {
+    "resize": "nearest-neighbor or pixel-aware only",
+    "quantization": "required",
+    "forbidden": [
+      "generic painterly upscalers",
+      "photo-real ESRGAN defaults",
+      "global detail enhancers in final export"
+    ]
+  }
+}
