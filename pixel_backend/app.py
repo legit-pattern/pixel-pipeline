@@ -13,8 +13,10 @@ import os
 import pathlib
 import re
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -90,6 +92,18 @@ _PALETTE_CACHE: dict[str, dict[str, Any]] | None = None
 _ASSET_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
 _CHARACTER_DNA_CACHE: dict[str, dict[str, Any]] | None = None
 
+# ── generation worker queue (single GPU-safe worker by default) ───────────────
+_JOB_QUEUE: deque[str] = deque()
+_JOB_QUEUE_LOCK = threading.Lock()
+_JOB_QUEUE_COND = threading.Condition(_JOB_QUEUE_LOCK)
+_ACTIVE_JOB_ID: str | None = None
+_WORKER_THREAD: threading.Thread | None = None
+
+try:
+    _GENERATION_RETRY_LIMIT = max(0, int(os.getenv("PIXEL_GENERATION_RETRY_LIMIT", "1")))
+except Exception:
+    _GENERATION_RETRY_LIMIT = 1
+
 
 def _resolve_startup_preload_model_family() -> str | None:
     raw = os.getenv("PIXEL_PRELOAD_MODEL_FAMILY", "pixel_art_diffusion_xl").strip()
@@ -120,6 +134,25 @@ def _preload_pipeline_on_startup() -> None:
     except Exception:
         # Keep the API online even if warm-up fails; first request can still attempt lazy load.
         log.exception("Startup preload failed for model_family=%s", model_family)
+
+
+def _reset_pipeline_cache(reason: str) -> None:
+    """Fully clear pipeline cache so the next load starts from a clean state."""
+    import torch
+
+    if not _PIPELINE_CACHE:
+        return
+
+    log.warning("Resetting pipeline cache (%s)", reason)
+    for old_pipe in _PIPELINE_CACHE.values():
+        try:
+            old_pipe.to("cpu")
+        except Exception:
+            pass
+    _PIPELINE_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _configure_logging() -> None:
@@ -277,6 +310,7 @@ class GenerateRequest(BaseModel):
 class JobResponse(BaseModel):
     job_id: str
     status: str
+    queue_position: int | None = None
 
 
 @dataclass
@@ -317,6 +351,113 @@ class JobStore:
 
 
 STORE = JobStore()
+
+
+def _enqueue_job(job_id: str) -> int:
+    """Append a job to the generation queue and return 1-based queue position."""
+    with _JOB_QUEUE_COND:
+        _JOB_QUEUE.append(job_id)
+        position = len(_JOB_QUEUE)
+        _JOB_QUEUE_COND.notify()
+        return position
+
+
+def _queue_position(job_id: str) -> int | None:
+    """Return queue position for a queued job (1-based), else None."""
+    with _JOB_QUEUE_LOCK:
+        try:
+            return list(_JOB_QUEUE).index(job_id) + 1
+        except ValueError:
+            return None
+
+
+def _queue_depth() -> int:
+    with _JOB_QUEUE_LOCK:
+        return len(_JOB_QUEUE)
+
+
+def _active_job_id() -> str | None:
+    with _JOB_QUEUE_LOCK:
+        return _ACTIVE_JOB_ID
+
+
+def _is_transient_generation_error(message: str) -> bool:
+    text = message.lower()
+    patterns = [
+        "tensor on device meta",
+        "expected device cuda",
+        "index is out of bounds",
+        "out of bounds for dimension",
+        "scheduler.step",
+    ]
+    return any(pattern in text for pattern in patterns)
+
+
+def _generation_worker_loop() -> None:
+    global _ACTIVE_JOB_ID
+
+    log.info("Generation worker started (retry_limit=%d)", _GENERATION_RETRY_LIMIT)
+    while True:
+        with _JOB_QUEUE_COND:
+            while not _JOB_QUEUE:
+                _JOB_QUEUE_COND.wait()
+            job_id = _JOB_QUEUE.popleft()
+            _ACTIVE_JOB_ID = job_id
+
+        try:
+            record = STORE.get(job_id)
+        except KeyError:
+            with _JOB_QUEUE_LOCK:
+                if _ACTIVE_JOB_ID == job_id:
+                    _ACTIVE_JOB_ID = None
+            continue
+
+        if record.cancelled:
+            record.status = "cancelled"
+            with _JOB_QUEUE_LOCK:
+                if _ACTIVE_JOB_ID == job_id:
+                    _ACTIVE_JOB_ID = None
+            continue
+
+        attempt = 0
+        while True:
+            _run_job(record)
+            if record.status in {"success", "cancelled"}:
+                break
+
+            err_msg = (record.error or {}).get("message", "")
+            if attempt >= _GENERATION_RETRY_LIMIT or not _is_transient_generation_error(err_msg):
+                break
+
+            attempt += 1
+            log.warning(
+                "Retrying transient generation failure for job %s (attempt %d/%d)",
+                record.job_id,
+                attempt,
+                _GENERATION_RETRY_LIMIT,
+            )
+            _reset_pipeline_cache(f"transient failure retry for job {record.job_id}")
+            record.status = "queued"
+            record.error = None
+            record.result = None
+            record.cancelled = False
+
+        with _JOB_QUEUE_LOCK:
+            if _ACTIVE_JOB_ID == job_id:
+                _ACTIVE_JOB_ID = None
+
+
+def _start_generation_worker_once() -> None:
+    global _WORKER_THREAD
+    with _JOB_QUEUE_LOCK:
+        if _WORKER_THREAD and _WORKER_THREAD.is_alive():
+            return
+        _WORKER_THREAD = threading.Thread(
+            target=_generation_worker_loop,
+            daemon=True,
+            name="pixel-generation-worker",
+        )
+        _WORKER_THREAD.start()
 
 
 def _is_base64_png(value: str) -> bool:
@@ -2441,8 +2582,8 @@ def _run_job(record: JobRecord) -> None:
         record.status = "cancelled"
         return
     try:
-        record.status = "pending"
         log.info("Job %s entered runner", record.job_id)
+        record.status = "pending"
         _run_generation(record)
         if record.cancelled and record.status != "failure":
             # If cancellation is requested while generation is running,
@@ -2478,8 +2619,7 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def warm_pipeline_after_startup() -> None:
-        import threading
-
+        _start_generation_worker_once()
         thread = threading.Thread(target=_preload_pipeline_on_startup, daemon=True, name="pixel-pipeline-preload")
         thread.start()
 
@@ -2659,6 +2799,7 @@ def create_app() -> FastAPI:
                 {
                     "job_id": record.job_id,
                     "status": record.status,
+                    "queue_position": _queue_position(record.job_id) if record.status == "queued" else None,
                     "created_at": datetime.fromtimestamp(record.created_at, timezone.utc).isoformat(),
                     "request": record.request.model_dump(),
                     "result": record.result,
@@ -2684,12 +2825,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         record = STORE.create(request)
+        queue_position = _enqueue_job(record.job_id)
         log.info("Job %s accepted by API", record.job_id)
-        import threading
-        thread = threading.Thread(target=_run_job, args=(record,), daemon=True)
-        thread.start()
+        log.info(
+            "Job %s queued at position %d (active=%s, queue_depth=%d)",
+            record.job_id,
+            queue_position,
+            _active_job_id(),
+            _queue_depth(),
+        )
         log.info("Job %s returned immediately to client with status=%s", record.job_id, record.status)
-        return JobResponse(job_id=record.job_id, status=record.status)
+        return JobResponse(job_id=record.job_id, status=record.status, queue_position=queue_position)
 
     @app.get("/api/pixel/jobs/{job_id}")
     def get_job(job_id: str) -> dict[str, Any]:
@@ -2701,6 +2847,9 @@ def create_app() -> FastAPI:
         return {
             "job_id": record.job_id,
             "status": record.status,
+            "queue_position": _queue_position(record.job_id) if record.status == "queued" else None,
+            "active_job_id": _active_job_id(),
+            "queue_depth": _queue_depth(),
             "result": record.result,
             "error": record.error,
         }
