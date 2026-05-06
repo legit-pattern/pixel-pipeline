@@ -1897,10 +1897,10 @@ def _run_generation(record: JobRecord) -> None:
     w = req.sheet.frame_width
     h = req.sheet.frame_height
     # Balanced-fast default: generate 6x per target frame, then snap to pixel grid.
-    # Keep multiples of 64 (SDXL sweet spot). For sprite lane we can safely use a
-    # lower minimum because post-processing enforces pixel-art structure afterwards.
+    # Keep multiples of 64 (SDXL sweet spot). Default minimum is 512 for SDXL
+    # composition quality before pixel-art post-processing.
     gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", "6")))
-    min_gen_default = "384" if req.lane == "sprite" else "512"
+    min_gen_default = "512"
     min_gen_size = max(256, int(os.getenv("PIXEL_MIN_GEN_SIZE", min_gen_default)))
     min_gen_size = ((min_gen_size + 63) // 64) * 64
     gen_w_raw = max(8, w) * gen_scale
