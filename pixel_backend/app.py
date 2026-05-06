@@ -91,6 +91,37 @@ _ASSET_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
 _CHARACTER_DNA_CACHE: dict[str, dict[str, Any]] | None = None
 
 
+def _resolve_startup_preload_model_family() -> str | None:
+    raw = os.getenv("PIXEL_PRELOAD_MODEL_FAMILY", "pixel_art_diffusion_xl").strip()
+    if not raw or raw.lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return raw
+
+
+def _preload_pipeline_on_startup() -> None:
+    if not _env_flag("PIXEL_PRELOAD_ON_STARTUP", default=True):
+        log.info("Startup preload disabled via PIXEL_PRELOAD_ON_STARTUP")
+        return
+
+    model_family = _resolve_startup_preload_model_family()
+    if not model_family:
+        log.info("Startup preload skipped: PIXEL_PRELOAD_MODEL_FAMILY is empty/disabled")
+        return
+
+    t0 = time.perf_counter()
+    try:
+        log.info("Startup preload begin for model_family=%s", model_family)
+        _load_pipeline(model_family)
+        log.info(
+            "Startup preload complete for model_family=%s in %.2fs",
+            model_family,
+            time.perf_counter() - t0,
+        )
+    except Exception:
+        # Keep the API online even if warm-up fails; first request can still attempt lazy load.
+        log.exception("Startup preload failed for model_family=%s", model_family)
+
+
 def _configure_logging() -> None:
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
@@ -979,16 +1010,28 @@ def _load_pipeline(model_family: str) -> Any:
     pipe = StableDiffusionXLPipeline.from_single_file(
         str(checkpoint_path),
         torch_dtype=dtype,
-        variant="fp16" if device == "cuda" else None,
         use_safetensors=True,
     )
-    pipe = pipe.to(device)
+    if device == "cuda":
+        # Prefer sequential offload on 12GB cards: slower, but significantly lower peak VRAM.
+        # Do NOT call pipe.to("cuda") before offload; hooks manage placement automatically.
+        offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
+        if offload_mode == "model":
+            pipe.enable_model_cpu_offload()
+            log.info("CUDA offload mode: model")
+        else:
+            pipe.enable_sequential_cpu_offload()
+            log.info("CUDA offload mode: sequential")
+    else:
+        pipe = pipe.to(device)
     pipe.enable_attention_slicing()
     # Diffusers >=0.39 deprecates pipe.enable_vae_slicing() for SDXL.
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
         pipe.vae.enable_slicing()
     else:
         pipe.enable_vae_slicing()
+    if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+        pipe.vae.enable_tiling()
     pipe.set_progress_bar_config(disable=False)
     log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
 
@@ -1853,26 +1896,34 @@ def _run_generation(record: JobRecord) -> None:
     # ── determine output size ─────────────────────────────────────────────────
     w = req.sheet.frame_width
     h = req.sheet.frame_height
-    # Professional default: generate 8x per target frame, then snap to pixel grid.
-    # Keep multiples of 64 (SDXL sweet spot) and minimum 512 for model stability.
-    gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", "8")))
+    # Balanced-fast default: generate 6x per target frame, then snap to pixel grid.
+    # Keep multiples of 64 (SDXL sweet spot). For sprite lane we can safely use a
+    # lower minimum because post-processing enforces pixel-art structure afterwards.
+    gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", "6")))
+    min_gen_default = "384" if req.lane == "sprite" else "512"
+    min_gen_size = max(256, int(os.getenv("PIXEL_MIN_GEN_SIZE", min_gen_default)))
+    min_gen_size = ((min_gen_size + 63) // 64) * 64
     gen_w_raw = max(8, w) * gen_scale
     gen_h_raw = max(8, h) * gen_scale
-    gen_w = max(512, ((gen_w_raw + 63) // 64) * 64)
-    gen_h = max(512, ((gen_h_raw + 63) // 64) * 64)
+    gen_w = max(min_gen_size, ((gen_w_raw + 63) // 64) * 64)
+    gen_h = max(min_gen_size, ((gen_h_raw + 63) // 64) * 64)
     log.info(
-        "Job %s target size: %dx%d (frame=%dx%d, scale=%dx)",
+        "Job %s target size: %dx%d (frame=%dx%d, scale=%dx, min_gen=%d)",
         record.job_id,
         gen_w,
         gen_h,
         req.sheet.frame_width,
         req.sheet.frame_height,
         gen_scale,
+        min_gen_size,
     )
 
     import torch
-    generator = torch.Generator(device=pipe.device.type)
-    if torch.cuda.is_available() and pipe.device.type == "cuda":
+    # With CPU offload enabled, pipe.device can be "meta". Generator must target
+    # a real execution device, not the internal placeholder device.
+    execution_device = "cuda" if torch.cuda.is_available() else "cpu"
+    generator = torch.Generator(device=execution_device)
+    if execution_device == "cuda":
         try:
             torch.cuda.reset_peak_memory_stats()
         except Exception:
@@ -1883,7 +1934,8 @@ def _run_generation(record: JobRecord) -> None:
     generator.manual_seed(actual_seed)
     log.info("Job %s seed=%d (requested=%d)", record.job_id, actual_seed, req.seed)
 
-    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", "30"))))
+    # 20 steps is a practical speed/quality trade-off for pixel-art lanes.
+    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", "20"))))
 
     def _log_step(step: int) -> None:
         if step == 0 or (step + 1) % 5 == 0 or (step + 1) == num_steps:
@@ -1918,7 +1970,15 @@ def _run_generation(record: JobRecord) -> None:
 
             t_img2img = time.perf_counter()
             log.info("Job %s starting img2img inference", record.job_id)
-            img2img = StableDiffusionXLImg2ImgPipeline(**pipe.components).to(pipe.device)
+            img2img = StableDiffusionXLImg2ImgPipeline(**pipe.components)
+            if torch.cuda.is_available():
+                offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
+                if offload_mode == "model":
+                    img2img.enable_model_cpu_offload()
+                else:
+                    img2img.enable_sequential_cpu_offload()
+            else:
+                img2img = img2img.to(pipe.device)
             resized = init_image.convert("RGB").resize((gen_w, gen_h))
             img2img_kwargs = {
                 "prompt": full_prompt,
@@ -2107,7 +2167,7 @@ def _run_generation(record: JobRecord) -> None:
 
     timing["save_outputs_s"] = round(time.perf_counter() - t_save, 4)
     timing["total_s"] = round(time.perf_counter() - t_job, 4)
-    if torch.cuda.is_available() and pipe.device.type == "cuda":
+    if execution_device == "cuda":
         try:
             timing["cuda_peak_allocated_mb"] = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 2)
             timing["cuda_peak_reserved_mb"] = round(torch.cuda.max_memory_reserved() / (1024 * 1024), 2)
@@ -2415,6 +2475,13 @@ def create_app() -> FastAPI:
         log.info("Startup checks passed")
     
     app = FastAPI(title="Pixel Studio Backend", version="0.1.0")
+
+    @app.on_event("startup")
+    async def warm_pipeline_after_startup() -> None:
+        import threading
+
+        thread = threading.Thread(target=_preload_pipeline_on_startup, daemon=True, name="pixel-pipeline-preload")
+        thread.start()
 
     cors_origins_raw = os.getenv("PIXEL_BACKEND_CORS_ORIGINS", "").strip()
     allow_origins: list[str] = []

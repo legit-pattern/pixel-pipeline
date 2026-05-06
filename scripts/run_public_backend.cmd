@@ -17,6 +17,14 @@ if "%BACKEND_PORT%"=="" set "BACKEND_PORT=48617"
 
 cd /d "%ROOT_DIR%"
 set "PIXEL_BACKEND_CORS_ORIGINS=%PAGES_ORIGIN%"
+set "PIXEL_GEN_SCALE=6"
+set "PIXEL_NUM_STEPS=20"
+set "PIXEL_MIN_GEN_SIZE=384"
+set "PIXEL_CUDA_OFFLOAD_MODE=sequential"
+set "PIXEL_PRELOAD_ON_STARTUP=1"
+set "PIXEL_PRELOAD_MODEL_FAMILY=pixel_art_diffusion_xl"
+echo [INFO] Pixel profile: scale=%PIXEL_GEN_SCALE% steps=%PIXEL_NUM_STEPS% min_gen=%PIXEL_MIN_GEN_SIZE% offload=%PIXEL_CUDA_OFFLOAD_MODE%
+echo [INFO] Startup preload: enabled=%PIXEL_PRELOAD_ON_STARTUP% model=%PIXEL_PRELOAD_MODEL_FAMILY%
 
 if exist "%ROOT_DIR%\.venv\Scripts\python.exe" (
   echo [INFO] Using venv python: %ROOT_DIR%\.venv\Scripts\python.exe
