@@ -211,7 +211,37 @@ type RawJobRecord = {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
+const API_BASE_STORAGE_KEY = "pixel_api_base_url";
+
+function normalizeBaseUrl(value: string | null | undefined): string {
+  return (value ?? "").trim().replace(/\/+$/, "");
+}
+
+function getRuntimeApiBaseUrl(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  const queryApi = normalizeBaseUrl(params.get("api"));
+  if (queryApi) {
+    try {
+      window.localStorage.setItem(API_BASE_STORAGE_KEY, queryApi);
+    } catch {
+      // Ignore storage errors and still use query value for this session.
+    }
+    return queryApi;
+  }
+
+  try {
+    return normalizeBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY));
+  } catch {
+    return "";
+  }
+}
+
+const API_BASE_URL =
+  normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL) || getRuntimeApiBaseUrl();
 
 function apiUrl(path: string): string {
   if (!API_BASE_URL) {
