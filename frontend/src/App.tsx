@@ -28,6 +28,7 @@ import { applyJobPatch, useJobPoller } from "./hooks/useJobPoller";
 type Tab = "app" | "library" | "editor";
 type Theme = "light" | "dark";
 type QualityProfile = "production" | "experimental";
+const RECOMMENDED_MODEL_ID = "pixel_art_diffusion_xl";
 
 const STORAGE_KEY = "pixel-studio-job-history";
 const STARS_KEY = "pixel-studio-starred-jobs";
@@ -661,6 +662,19 @@ function App() {
     }
     return window.location.hostname.endsWith("github.io");
   }, []);
+  const lockModelSelection = useMemo(
+    () => isGithubPagesFrontend && availableModels.some((model) => model.id === RECOMMENDED_MODEL_ID),
+    [isGithubPagesFrontend, availableModels],
+  );
+
+  useEffect(() => {
+    if (!lockModelSelection) {
+      return;
+    }
+    if (modelFamily !== RECOMMENDED_MODEL_ID) {
+      setModelFamily(RECOMMENDED_MODEL_ID);
+    }
+  }, [lockModelSelection, modelFamily]);
 
   useEffect(() => {
     if (!["queued", "pending"].includes(jobState.status)) {
@@ -1408,16 +1422,22 @@ function App() {
 
             <label>
               Model profile
-              <select value={modelFamily} onChange={(e) => setModelFamily(e.target.value)}>
-                {availableModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.label}
-                  </option>
-                ))}
-              </select>
+              {lockModelSelection ? (
+                <input value="Pixel Art Diffusion XL SpriteShaper ★ Recommended" readOnly />
+              ) : (
+                <select value={modelFamily} onChange={(e) => setModelFamily(e.target.value)}>
+                  {availableModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}
+                    </option>
+                  ))}
+                </select>
+              )}
             </label>
             <p className="muted">
-              PAD-XL SpriteShaper is now the active foundation. Choose one profile/checkpoint per run; profiles are not combined automatically.
+              {lockModelSelection
+                ? "Public mode keeps one stable model path to reduce failures and keep output consistency."
+                : "Choose one profile/checkpoint per run; profiles are not combined automatically."}
             </p>
 
             <label>

@@ -176,6 +176,30 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_execution_device(torch_module: Any) -> str:
+    """Resolve execution device with optional env override.
+
+    PIXEL_EXECUTION_DEVICE values:
+    - auto (default): use CUDA when available
+    - cuda: force CUDA, falls back to CPU if unavailable
+    - cpu: force CPU (stability mode)
+    """
+    requested = os.getenv("PIXEL_EXECUTION_DEVICE", "auto").strip().lower()
+    cuda_available = bool(torch_module.cuda.is_available())
+
+    if requested == "cpu":
+        return "cpu"
+    if requested == "cuda":
+        if cuda_available:
+            return "cuda"
+        log.warning("PIXEL_EXECUTION_DEVICE=cuda requested but CUDA is unavailable; falling back to CPU")
+        return "cpu"
+    if requested not in {"", "auto"}:
+        log.warning("Unknown PIXEL_EXECUTION_DEVICE=%s; using auto", requested)
+
+    return "cuda" if cuda_available else "cpu"
+
+
 class PaletteInput(BaseModel):
     preset: str = "custom"
     size: int = 16
@@ -1146,7 +1170,7 @@ def _load_pipeline(model_family: str) -> Any:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_execution_device(torch)
     dtype = torch.float16 if device == "cuda" else torch.float32
 
     t0 = time.perf_counter()
@@ -1960,11 +1984,12 @@ def _run_generation(record: JobRecord) -> None:
         job_dir.mkdir(exist_ok=True)
         log.info("Job %s output dir: %s", record.job_id, job_dir)
 
-    # Enforce GPU-only execution for SDXL generation.
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA/GPU is not available on this host. "
-            "SDXL model loading requires a CUDA-enabled environment."
+    execution_device = _resolve_execution_device(torch)
+    if execution_device != "cuda":
+        log.warning(
+            "Job %s running in CPU fallback mode (PIXEL_EXECUTION_DEVICE=%s)",
+            record.job_id,
+            os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
         )
 
     t_pipe = time.perf_counter()
@@ -2073,7 +2098,7 @@ def _run_generation(record: JobRecord) -> None:
     import torch
     # With CPU offload enabled, pipe.device can be "meta". Generator must target
     # a real execution device, not the internal placeholder device.
-    execution_device = "cuda" if torch.cuda.is_available() else "cpu"
+    execution_device = _resolve_execution_device(torch)
     generator = torch.Generator(device=execution_device)
     if execution_device == "cuda":
         try:
