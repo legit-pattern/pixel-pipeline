@@ -41,10 +41,69 @@ function sanitizeFilenamePart(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 48) || "asset";
 }
 
+function formatElapsed(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
 const TEMPLATES = {
   hero: "Create a single-frame game-ready pixel art main character sprite for an isometric 2.5D action RPG. Young male wanderer, practical layered traveler clothing, 3/4 view, neutral ready stance, clean pixel art, 64x64, transparent background, no text, no UI, no environment.",
   frog: "Create a game-ready pixel art enemy sprite sheet for an isometric 2.5D action RPG. Frog-like tower guardian scout, 12 frames total (4 idle, 4 walk, 4 attack), each 64x64, single-row spritesheet, transparent background, no text, no UI, no environment.",
 };
+
+const STARTER_PROMPTS_BY_OUTPUT_MODE: Record<string, string> = {
+  single_sprite:
+    "Pixel Art player character sprite, single frame, 3/4 view, clean silhouette, readable pose, 32-bit style, transparent background, no text, no UI, no watermark.",
+  sprite_sheet:
+    "Pixel Art character sprite sheet, 12 frames total (idle, walk, attack), each 64x64, consistent proportions across frames, clean silhouette, transparent background, no text, no UI.",
+  prop_sheet:
+    "Pixel Art prop sheet, top-down game props, consistent scale, clean outlines, limited palette, transparent background, no text, no UI, no watermark.",
+  tile_chunk:
+    "Pixel Art grass tile, seamless, top-down view, subtle texture, dark green base with light green highlights, tiny wildflowers and small pebbles, 16-bit style, tileable edges, no vignette, no text.",
+  ui_module:
+    "Pixel Art UI module, RPG-style panel and buttons, crisp borders, high contrast readability, transparent background, clean icon slots, no text labels, no watermark.",
+};
+
+const STARTER_PROMPTS_BY_LANE: Record<string, string> = {
+  sprite:
+    "Pixel Art character sprite, game-ready, 3/4 view, readable silhouette, limited palette, crisp edges, transparent background, no text, no UI.",
+  world:
+    "Pixel Art environment tile, seamless, top-down view, repeat-safe edges, subtle texture variation, balanced contrast, 16-bit style, no vignette, no text.",
+  prop:
+    "Pixel Art prop asset, game-ready, clean shape language, readable from gameplay distance, limited palette, transparent background, no text.",
+  ui:
+    "Pixel Art UI element, crisp panel/button module, strong readability, clear edge contrast, transparent background, no text labels.",
+  portrait:
+    "Pixel Art character portrait bust, centered composition, expressive face, controlled palette, clean shading clusters, transparent background, no text.",
+};
+
+function getStarterPrompt(lane: string, outputMode: string): string {
+  const byOutput = STARTER_PROMPTS_BY_OUTPUT_MODE[outputMode];
+  if (byOutput) {
+    return byOutput;
+  }
+  const byLane = STARTER_PROMPTS_BY_LANE[lane];
+  if (byLane) {
+    return byLane;
+  }
+  return STARTER_PROMPTS_BY_LANE.sprite;
+}
+
+type QuickStartPreset = {
+  label: string;
+  lane: string;
+  outputMode: string;
+  outputFormat: string;
+};
+
+const QUICK_START_PRESETS: QuickStartPreset[] = [
+  { label: "Character Sprite", lane: "sprite", outputMode: "single_sprite", outputFormat: "png" },
+  { label: "Animation Sheet", lane: "sprite", outputMode: "sprite_sheet", outputFormat: "spritesheet_png" },
+  { label: "Tile Chunk", lane: "world", outputMode: "tile_chunk", outputFormat: "png" },
+  { label: "UI Module", lane: "ui", outputMode: "ui_module", outputFormat: "png" },
+];
 
 const DEFAULT_MODELS: ModelOption[] = [
   {
@@ -446,7 +505,7 @@ function App() {
 
   const [frameWidth, setFrameWidth] = useState<number>(savedSettings.frameWidth ?? 64);
   const [frameHeight, setFrameHeight] = useState<number>(savedSettings.frameHeight ?? 64);
-  const [columns, setColumns] = useState<number>(savedSettings.columns ?? 12);
+  const [columns, setColumns] = useState<number>(savedSettings.columns ?? 1);
   const [rows, setRows] = useState<number>(savedSettings.rows ?? 1);
   const [padding, setPadding] = useState<number>(savedSettings.padding ?? 0);
   const [tileSize, setTileSize] = useState<number>(savedSettings.tileSize ?? 64);
@@ -473,9 +532,9 @@ function App() {
   // generation quality controls
   const [seed, setSeed] = useState<number>(savedSettings.seed ?? -1);
   const [cfgScale, setCfgScale] = useState<number>(savedSettings.cfgScale ?? 7.5);
-  const [enhancePrompt, setEnhancePrompt] = useState<boolean>(savedSettings.enhancePrompt ?? true);
-  const [autoPipeline, setAutoPipeline] = useState<boolean>(savedSettings.autoPipeline ?? true);
-  const [keyframeFirst, setKeyframeFirst] = useState<boolean>(savedSettings.keyframeFirst ?? true);
+  const [enhancePrompt, setEnhancePrompt] = useState<boolean>(savedSettings.enhancePrompt ?? false);
+  const [autoPipeline, setAutoPipeline] = useState<boolean>(savedSettings.autoPipeline ?? false);
+  const [keyframeFirst, setKeyframeFirst] = useState<boolean>(savedSettings.keyframeFirst ?? false);
   const [variationStrength, setVariationStrength] = useState<number>(savedSettings.variationStrength ?? 0.35);
   const [consistencyThreshold, setConsistencyThreshold] = useState<number>(savedSettings.consistencyThreshold ?? 0.65);
   const [frameRetryBudget, setFrameRetryBudget] = useState<number>(savedSettings.frameRetryBudget ?? 2);
@@ -528,6 +587,7 @@ function App() {
     [],
   );
   const { state: jobState, submit: submitJob, cancel: cancelJob } = useJobPoller(handleJobUpdate);
+  const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
 
   const availableModels = models.length > 0 ? models : DEFAULT_MODELS;
   const availablePalettes = palettes.length > 0 ? palettes : DEFAULT_PALETTES;
@@ -545,12 +605,80 @@ function App() {
     const total = frameScores.reduce((acc, item) => acc + item.score, 0);
     return total / frameScores.length;
   }, [frameScores]);
+  const progressPercent = useMemo(() => {
+    const step = Number(jobState.progress?.step ?? NaN);
+    const total = Number(jobState.progress?.total ?? NaN);
+    if (!Number.isFinite(step) || !Number.isFinite(total) || total <= 0) {
+      return null;
+    }
+    return Math.max(0, Math.min(100, (step / total) * 100));
+  }, [jobState.progress?.step, jobState.progress?.total]);
+  const elapsedSeconds = useMemo(() => {
+    const progress = jobState.progress;
+    if (!progress) {
+      return null;
+    }
+
+    const isActive = ["queued", "pending"].includes(jobState.status);
+    const anchor = progress.started_at ?? progress.created_at;
+    if (isActive && typeof anchor === "number" && Number.isFinite(anchor)) {
+      return Math.max(0, (progressNowMs / 1000) - anchor);
+    }
+
+    const serverElapsed = Number(progress.elapsed_s ?? NaN);
+    if (Number.isFinite(serverElapsed)) {
+      return Math.max(0, serverElapsed);
+    }
+    return null;
+  }, [jobState.progress, jobState.status, progressNowMs]);
+  const etaSeconds = useMemo(() => {
+    if (jobState.status !== "pending") {
+      return null;
+    }
+    const step = Number(jobState.progress?.step ?? NaN);
+    const total = Number(jobState.progress?.total ?? NaN);
+    if (!Number.isFinite(step) || !Number.isFinite(total) || step <= 0 || total <= step) {
+      return null;
+    }
+    if (elapsedSeconds == null || elapsedSeconds <= 0) {
+      return null;
+    }
+    const secPerStep = elapsedSeconds / step;
+    const remaining = secPerStep * (total - step);
+    return Number.isFinite(remaining) ? Math.max(0, remaining) : null;
+  }, [jobState.progress?.step, jobState.progress?.total, jobState.status, elapsedSeconds]);
+  const progressPhaseLabel = useMemo(() => {
+    const phase = (jobState.progress?.phase ?? "").toString().trim().toLowerCase();
+    if (!phase) {
+      return null;
+    }
+    const labels: Record<string, string> = {
+      queued: "Queued",
+      starting: "Starting",
+      preparing: "Preparing",
+      inference: "Generating image",
+      post_processing: "Post-processing",
+      saving_outputs: "Saving outputs",
+      complete: "Complete",
+      cancelled: "Cancelled",
+      failed: "Failed",
+    };
+    return labels[phase] ?? phase;
+  }, [jobState.progress?.phase]);
   const isGithubPagesFrontend = useMemo(() => {
     if (typeof window === "undefined") {
       return false;
     }
     return window.location.hostname.endsWith("github.io");
   }, []);
+
+  useEffect(() => {
+    if (!["queued", "pending"].includes(jobState.status)) {
+      return;
+    }
+    const id = window.setInterval(() => setProgressNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(id);
+  }, [jobState.status]);
 
   const harmonizedPalette = useMemo(() => {
     return customColors
@@ -876,6 +1004,18 @@ function App() {
 
   function setTemplate(kind: "hero" | "frog") {
     setPrompt(TEMPLATES[kind]);
+  }
+
+  function applyStarterPromptForSelection() {
+    setPrompt(getStarterPrompt(lane, outputMode));
+  }
+
+  function applyQuickStart(preset: QuickStartPreset) {
+    setLane(preset.lane);
+    setOutputMode(preset.outputMode);
+    setOutputFormat(preset.outputFormat);
+    setPrompt(getStarterPrompt(preset.lane, preset.outputMode));
+    setValidationError("");
   }
 
   async function handleSourceImage(e: ChangeEvent<HTMLInputElement>) {
@@ -1260,6 +1400,27 @@ function App() {
           <section className="panel controls" style={{ animationDelay: "80ms" }}>
             <h2>Create</h2>
 
+            <div className="flow-banner" role="region" aria-label="Quick start">
+              <p className="flow-title">Fast path</p>
+              <div className="flow-steps" aria-hidden="true">
+                <span>1. Pick workflow</span>
+                <span>2. Adjust prompt</span>
+                <span>3. Submit</span>
+              </div>
+              <div className="quickstart-row">
+                {QUICK_START_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className="quickstart-pill"
+                    onClick={() => applyQuickStart(preset)}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <label>
               Style profile
               <select value={modelFamily} onChange={(e) => setModelFamily(e.target.value)}>
@@ -1310,6 +1471,7 @@ function App() {
             </p>
 
             <div className="template-row">
+              <button onClick={applyStarterPromptForSelection}>Use lane starter prompt</button>
               <button onClick={() => setTemplate("hero")}>Character template</button>
               <button onClick={() => setTemplate("frog")}>Enemy sheet template</button>
             </div>
@@ -1355,6 +1517,13 @@ function App() {
                   ))}
                 </select>
               </label>
+            </div>
+
+            <div className="submit-dock" role="region" aria-label="Primary action">
+              <button className="submit submit-primary" onClick={handleSubmitJob}>
+                Submit Generation
+              </button>
+              <p className="muted">Core settings above. Advanced settings can be expanded below when needed.</p>
             </div>
 
             <div className="subpanel">
@@ -1484,8 +1653,13 @@ function App() {
               </div>
             </div>
 
+            <details className="advanced-disclosure">
+              <summary>Advanced settings</summary>
+              <p className="muted">Use these only when you need finer control over style, tiling, conditioning, cleanup, or generation behavior.</p>
+
             <div className="subpanel">
               <h3>Tile controls</h3>
+              <p className="muted">Primarily useful for tile-focused outputs; can be left at defaults for sprites and props.</p>
               <div className="inline-grid three">
                 <label>
                   Tile size
@@ -1549,6 +1723,7 @@ function App() {
 
             <div className="subpanel">
               <h3>Source image (PNG)</h3>
+              <p className="muted">Optional reference input. Skip this section for pure text-to-image generation.</p>
               <input type="file" accept="image/png" onChange={handleSourceImage} />
               {sourcePreview && (
                 <div className="source-preview">
@@ -1773,6 +1948,7 @@ function App() {
 
             <div className="subpanel">
               <h3>Generation controls</h3>
+              <p className="muted">Expert controls for consistency and quality tuning. Defaults are usually enough.</p>
               <label className="field-row">
                 <span>Quality profile</span>
                 <select
@@ -1878,6 +2054,7 @@ function App() {
                 />
               </label>
             </div>
+            </details>
 
             {validationError && <p className="error">{validationError}</p>}
 
@@ -1890,9 +2067,6 @@ function App() {
               </ul>
             </div>
 
-            <button className="submit" onClick={handleSubmitJob}>
-              Submit Generation
-            </button>
           </section>
 
           <section className="panel results" style={{ animationDelay: "180ms" }}>
@@ -1902,6 +2076,29 @@ function App() {
               <p className="status-label">Status</p>
               <p className={`status-value status-${jobState.status}`}>{jobState.status}</p>
               {jobState.jobId && <p className="mono">Job: {jobState.jobId}</p>}
+              {["queued", "pending"].includes(jobState.status) && (
+                <div className="status-progress-wrap">
+                  <div className="status-progress-meta">
+                    <span>{progressPhaseLabel ?? (jobState.status === "pending" ? "Generating image" : "Queued")}</span>
+                    <span>
+                      {elapsedSeconds != null ? `Elapsed ${formatElapsed(elapsedSeconds)}` : ""}
+                      {elapsedSeconds != null && etaSeconds != null ? " | " : ""}
+                      {etaSeconds != null ? `ETA ca ${formatElapsed(etaSeconds)}` : ""}
+                    </span>
+                  </div>
+                  <div className={`status-progress ${progressPercent == null ? "is-indeterminate" : ""}`}>
+                    <div
+                      className="status-progress-fill"
+                      style={progressPercent == null ? undefined : { width: `${progressPercent}%` }}
+                    />
+                  </div>
+                  {progressPercent != null && jobState.progress?.step != null && jobState.progress?.total != null && (
+                    <p className="status-progress-text">
+                      Step {jobState.progress.step}/{jobState.progress.total}
+                    </p>
+                  )}
+                </div>
+              )}
               {["queued", "pending"].includes(jobState.status) && (
                 <button onClick={handleCancelJob}>Cancel Job</button>
               )}

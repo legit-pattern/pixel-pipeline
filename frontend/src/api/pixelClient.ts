@@ -193,9 +193,20 @@ export type JobRecord = {
   createdAt: string;
 };
 
+export type JobProgress = {
+  phase?: string | null;
+  step?: number | null;
+  total?: number | null;
+  elapsed_s?: number | null;
+  started_at?: number | null;
+  created_at?: number | null;
+  finished_at?: number | null;
+};
+
 export type JobStatus = {
   job_id: string;
   status: string;
+  progress?: JobProgress;
   result?: JobResult;
   error?: { code?: string; message?: string };
 };
@@ -354,8 +365,10 @@ export async function pollJob(jobId: string): Promise<JobStatus> {
   };
 }
 
-export async function cancelJob(jobId: string): Promise<void> {
-  await fetch(apiUrl(`/api/pixel/jobs/${jobId}/cancel`), { method: "POST" });
+export async function cancelJob(jobId: string): Promise<{ job_id: string; status: string }> {
+  return handleResponse(
+    await fetch(apiUrl(`/api/pixel/jobs/${jobId}/cancel`), { method: "POST" }),
+  );
 }
 
 export async function fetchJobs(opts: {

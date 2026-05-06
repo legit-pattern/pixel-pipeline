@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   cancelJob as apiCancelJob,
+  type JobProgress,
   normalizeJobRecord,
   pollJob as apiPollJob,
   submitGenerate,
@@ -25,6 +26,8 @@ export type PollerState = {
   result: JobResult | null;
   /** Error message to surface to the user. */
   errorMessage: string;
+  /** Live progress payload from backend when available. */
+  progress: JobProgress | null;
 };
 
 const IDLE: PollerState = {
@@ -32,6 +35,7 @@ const IDLE: PollerState = {
   status: "idle",
   result: null,
   errorMessage: "",
+  progress: null,
 };
 
 const POLL_INTERVAL_MS = 3_500;
@@ -79,6 +83,7 @@ export function useJobPoller(
       setState((prev) => ({
         ...prev,
         status: data.status,
+        progress: data.progress ?? null,
         result: data.result ?? null,
         errorMessage: data.error?.message ?? "",
       }));
@@ -97,6 +102,7 @@ export function useJobPoller(
           ...prev,
           status: "cancelled",
           errorMessage: "Job no longer exists on backend (likely after server restart).",
+          progress: null,
         }));
         onJobUpdate({
           job_id: jobId,
@@ -114,14 +120,14 @@ export function useJobPoller(
   // ── submit ────────────────────────────────────────────────────────────────
   const submit = useCallback(
     async (request: GenerateRequest): Promise<JobRecord> => {
-      setState({ jobId: "", status: "queued", result: null, errorMessage: "" });
+      setState({ jobId: "", status: "queued", result: null, errorMessage: "", progress: null });
 
       try {
         const data = await submitGenerate(request);
         const jobId = data.job_id;
         activeJobIdRef.current = jobId;
 
-        setState({ jobId, status: data.status, result: null, errorMessage: "" });
+        setState({ jobId, status: data.status, result: null, errorMessage: "", progress: null });
 
         const record: JobRecord = {
           job_id: jobId,
@@ -138,7 +144,7 @@ export function useJobPoller(
         return record;
       } catch (err) {
         const message = err instanceof Error ? err.message : "Submit failed";
-        setState({ jobId: "", status: "failure", result: null, errorMessage: message });
+        setState({ jobId: "", status: "failure", result: null, errorMessage: message, progress: null });
         throw err;
       }
     },
@@ -153,11 +159,16 @@ export function useJobPoller(
       return;
     }
     try {
-      await apiCancelJob(id);
-      setState((prev) => ({ ...prev, status: "cancelled" }));
-      onJobUpdate({ job_id: id, status: "cancelled", result: undefined, error: null });
-    } catch {
-      // Swallow – the job may already be complete
+      const data = await apiCancelJob(id);
+      const nextStatus = data.status;
+      if (["success", "failure", "cancelled"].includes(nextStatus)) {
+        activeJobIdRef.current = "";
+      }
+      setState((prev) => ({ ...prev, status: nextStatus }));
+      onJobUpdate({ job_id: id, status: nextStatus, result: undefined, error: null });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Cancel failed";
+      setState((prev) => ({ ...prev, errorMessage: message }));
     }
   }, [onJobUpdate]);
 
