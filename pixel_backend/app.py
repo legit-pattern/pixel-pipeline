@@ -200,6 +200,31 @@ def _resolve_execution_device(torch_module: Any) -> str:
     return "cuda" if cuda_available else "cpu"
 
 
+def _gpu_diag_enabled() -> bool:
+    return _env_flag("PIXEL_GPU_DIAGNOSTICS", default=False)
+
+
+def _log_gpu_stage(torch_module: Any, stage: str) -> None:
+    if not _gpu_diag_enabled():
+        return
+    try:
+        if not torch_module.cuda.is_available():
+            log.info("[gpu-diag] %s | cuda_unavailable", stage)
+            return
+        device_name = torch_module.cuda.get_device_name(0)
+        allocated = round(torch_module.cuda.memory_allocated() / (1024 * 1024), 2)
+        reserved = round(torch_module.cuda.memory_reserved() / (1024 * 1024), 2)
+        log.info(
+            "[gpu-diag] %s | device=%s alloc_mb=%.2f reserved_mb=%.2f",
+            stage,
+            device_name,
+            allocated,
+            reserved,
+        )
+    except Exception as exc:
+        log.info("[gpu-diag] %s | probe_failed=%s", stage, exc)
+
+
 class PaletteInput(BaseModel):
     preset: str = "custom"
     size: int = 16
@@ -1180,24 +1205,37 @@ def _load_pipeline(model_family: str) -> Any:
         model_family,
         checkpoint_path.name,
     )
+    _log_gpu_stage(torch, "before_from_single_file")
     pipe = StableDiffusionXLPipeline.from_single_file(
         str(checkpoint_path),
         torch_dtype=dtype,
         use_safetensors=True,
     )
+    _log_gpu_stage(torch, "after_from_single_file")
     if device == "cuda":
         # Prefer sequential offload on 12GB cards: slower, but significantly lower peak VRAM.
         # Do NOT call pipe.to("cuda") before offload; hooks manage placement automatically.
         offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
         if offload_mode == "model":
+            _log_gpu_stage(torch, "before_enable_model_cpu_offload")
             pipe.enable_model_cpu_offload()
             log.info("CUDA offload mode: model")
+            _log_gpu_stage(torch, "after_enable_model_cpu_offload")
+        elif offload_mode == "none":
+            _log_gpu_stage(torch, "before_pipe_to_cuda")
+            pipe = pipe.to("cuda")
+            log.info("CUDA offload mode: none (direct cuda)")
+            _log_gpu_stage(torch, "after_pipe_to_cuda")
         else:
+            _log_gpu_stage(torch, "before_enable_sequential_cpu_offload")
             pipe.enable_sequential_cpu_offload()
             log.info("CUDA offload mode: sequential")
+            _log_gpu_stage(torch, "after_enable_sequential_cpu_offload")
     else:
         pipe = pipe.to(device)
+    _log_gpu_stage(torch, "before_attention_slicing")
     pipe.enable_attention_slicing()
+    _log_gpu_stage(torch, "after_attention_slicing")
     # Diffusers >=0.39 deprecates pipe.enable_vae_slicing() for SDXL.
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
         pipe.vae.enable_slicing()
@@ -1205,6 +1243,7 @@ def _load_pipeline(model_family: str) -> Any:
         pipe.enable_vae_slicing()
     if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
+    _log_gpu_stage(torch, "after_vae_setup")
     pipe.set_progress_bar_config(disable=False)
     log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
 
@@ -2598,6 +2637,9 @@ def _runtime_diagnostics() -> dict[str, Any]:
             "preferred": "cuda" if torch.cuda.is_available() else "cpu",
             "cuda_available": torch.cuda.is_available(),
             "cuda_device_count": torch.cuda.device_count(),
+            "execution_device_request": os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
+            "cuda_offload_mode": os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential"),
+            "gpu_diagnostics_enabled": _gpu_diag_enabled(),
         }
         issues: list[str] = []
         if diffusers_spec is None:
