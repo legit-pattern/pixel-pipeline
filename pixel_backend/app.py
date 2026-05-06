@@ -322,6 +322,11 @@ class JobRecord:
     result: dict[str, Any] | None = None
     error: dict[str, str] | None = None
     cancelled: bool = False
+    started_at: float | None = None
+    finished_at: float | None = None
+    phase: str | None = None
+    progress_step: int | None = None
+    progress_total: int | None = None
 
 
 @dataclass
@@ -335,6 +340,7 @@ class JobStore:
             status="queued",
             created_at=time.time(),
             request=request,
+            phase="queued",
         )
         self.jobs[job_id] = record
         return record
@@ -414,6 +420,8 @@ def _generation_worker_loop() -> None:
 
         if record.cancelled:
             record.status = "cancelled"
+            record.phase = "cancelled"
+            record.finished_at = time.time()
             with _JOB_QUEUE_LOCK:
                 if _ACTIVE_JOB_ID == job_id:
                     _ACTIVE_JOB_ID = None
@@ -1921,6 +1929,9 @@ def _run_generation(record: JobRecord) -> None:
     from PIL import Image
 
     req = record.request
+    record.phase = "preparing"
+    record.progress_step = None
+    record.progress_total = None
     t_job = time.perf_counter()
     timing: dict[str, Any] = {
         "source_decode_s": 0.0,
@@ -2077,8 +2088,12 @@ def _run_generation(record: JobRecord) -> None:
 
     # 20 steps is a practical speed/quality trade-off for pixel-art lanes.
     num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", "20"))))
+    record.progress_total = num_steps
+    record.progress_step = 0
 
     def _log_step(step: int) -> None:
+        record.phase = "inference"
+        record.progress_step = min(num_steps, max(0, step + 1))
         if step == 0 or (step + 1) % 5 == 0 or (step + 1) == num_steps:
             log.info("Job %s progress: step %d/%d", record.job_id, step + 1, num_steps)
 
@@ -2157,6 +2172,8 @@ def _run_generation(record: JobRecord) -> None:
         log.info("Job %s txt2img finished in %.2fs", record.job_id, timing["inference_s"])
 
     # ── post-processing (optional, all opt-in) ────────────────────────────────
+    record.phase = "post_processing"
+    record.progress_step = num_steps
     t_post = time.perf_counter()
     result_img = _apply_post_processing(result_img, req, effective_pp, palette_colors, palette_ctx["profile"])
     timing["post_processing_s"] = round(time.perf_counter() - t_post, 4)
@@ -2176,6 +2193,7 @@ def _run_generation(record: JobRecord) -> None:
     )
 
     # ── save/serialize outputs ───────────────────────────────────────────────
+    record.phase = "saving_outputs"
     t_save = time.perf_counter()
     frame_scores: list[dict[str, Any]] = []
     if req.keyframe_first and (req.sheet.columns * req.sheet.rows) > 1:
@@ -2330,6 +2348,9 @@ def _run_generation(record: JobRecord) -> None:
         "spritesheet_png": spritesheet_png_url,
     }
     record.status = "success"
+    record.phase = "complete"
+    record.progress_step = num_steps
+    record.finished_at = time.time()
     record.result = {
         "image_url": image_url_by_format.get(req.output_format, png_url),
         "spritesheet_url": spritesheet_png_url,
@@ -2580,21 +2601,30 @@ def _run_job(record: JobRecord) -> None:
     if record.cancelled:
         log.info("Job %s cancelled before start", record.job_id)
         record.status = "cancelled"
+        record.phase = "cancelled"
+        record.finished_at = time.time()
         return
     try:
         log.info("Job %s entered runner", record.job_id)
         record.status = "pending"
+        record.phase = "starting"
+        record.started_at = time.time()
+        record.finished_at = None
         _run_generation(record)
         if record.cancelled and record.status != "failure":
             # If cancellation is requested while generation is running,
             # cancellation wins over success for deterministic terminal state.
             record.status = "cancelled"
+            record.phase = "cancelled"
+            record.finished_at = time.time()
             record.result = None
             record.error = None
             log.info("Job %s marked cancelled after generation return", record.job_id)
     except Exception as exc:
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
+        record.phase = "failed"
+        record.finished_at = time.time()
         record.error = {
             "message": str(exc),
             "type": type(exc).__name__,
@@ -2824,6 +2854,9 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        # Defensive lazy-start so queue processing still works when startup
+        # lifecycle hooks are not executed (for example in some test harnesses).
+        _start_generation_worker_once()
         record = STORE.create(request)
         queue_position = _enqueue_job(record.job_id)
         log.info("Job %s accepted by API", record.job_id)
@@ -2844,12 +2877,32 @@ def create_app() -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
 
+        now = time.time()
+        if record.status == "queued":
+            elapsed_s = round(max(0.0, now - record.created_at), 2)
+        elif record.started_at is not None:
+            end_ts = record.finished_at if record.finished_at is not None else now
+            elapsed_s = round(max(0.0, end_ts - record.started_at), 2)
+        else:
+            elapsed_s = None
+
+        progress: dict[str, Any] = {
+            "phase": record.phase,
+            "step": record.progress_step,
+            "total": record.progress_total,
+            "elapsed_s": elapsed_s,
+            "started_at": record.started_at,
+            "created_at": record.created_at,
+            "finished_at": record.finished_at,
+        }
+
         return {
             "job_id": record.job_id,
             "status": record.status,
             "queue_position": _queue_position(record.job_id) if record.status == "queued" else None,
             "active_job_id": _active_job_id(),
             "queue_depth": _queue_depth(),
+            "progress": progress,
             "result": record.result,
             "error": record.error,
         }
@@ -2866,6 +2919,8 @@ def create_app() -> FastAPI:
 
         record.cancelled = True
         record.status = "cancelled"
+        record.phase = "cancelled"
+        record.finished_at = time.time()
         return {"job_id": job_id, "status": "cancelled"}
 
     @app.post("/api/pixel/palettes/from-image")
