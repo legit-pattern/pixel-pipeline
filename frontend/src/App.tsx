@@ -23,6 +23,7 @@ import {
   type ModelOption,
   type PalettePreset,
   type PostProcessingInput,
+  type SourceAnalysis,
 } from "./api/pixelClient";
 import { applyJobPatch, useJobPoller } from "./hooks/useJobPoller";
 
@@ -148,6 +149,13 @@ type StudioSettings = {
   ppShadowReinforcement: number;
   ppHighlightReinforcement: number;
   ppPaletteStrictness: number;
+  sourceProcessingMode: string;
+  reframeCanvasScaleX: number;
+  reframeCanvasScaleY: number;
+  refframeFillMode: string;
+  reframeAnchorX: string;
+  reframeAnchorY: string;
+  motionSpaceHint: string;
   seed: number;
   cfgScale: number;
   enhancePrompt: boolean;
@@ -209,6 +217,67 @@ function getAnimationFrameScores(metadata: unknown): FrameScore[] {
     }
   }
   return normalized;
+}
+
+function getSourceAnalysis(metadata: unknown): SourceAnalysis | null {
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+
+  const sourceAnalysis = (metadata as Record<string, unknown>).source_analysis;
+  if (!sourceAnalysis || typeof sourceAnalysis !== "object") {
+    return null;
+  }
+
+  const raw = sourceAnalysis as Record<string, unknown>;
+  const isPixelArt = raw.is_pixel_art;
+  const detectedPaletteSize = raw.detected_palette_size;
+  const processingApplied = raw.processing_applied;
+
+  if (
+    typeof isPixelArt !== "boolean" ||
+    typeof detectedPaletteSize !== "number" ||
+    !Array.isArray(processingApplied)
+  ) {
+    return null;
+  }
+
+  const originalBoundsRaw = raw.original_bounds;
+  const reframedBoundsRaw = raw.reframed_bounds;
+
+  const originalBounds =
+    originalBoundsRaw &&
+    typeof originalBoundsRaw === "object" &&
+    typeof (originalBoundsRaw as Record<string, unknown>).width === "number" &&
+    typeof (originalBoundsRaw as Record<string, unknown>).height === "number"
+      ? {
+          width: (originalBoundsRaw as Record<string, number>).width,
+          height: (originalBoundsRaw as Record<string, number>).height,
+        }
+      : undefined;
+
+  const reframedBounds =
+    reframedBoundsRaw &&
+    typeof reframedBoundsRaw === "object" &&
+    typeof (reframedBoundsRaw as Record<string, unknown>).width === "number" &&
+    typeof (reframedBoundsRaw as Record<string, unknown>).height === "number"
+      ? {
+          width: (reframedBoundsRaw as Record<string, number>).width,
+          height: (reframedBoundsRaw as Record<string, number>).height,
+        }
+      : undefined;
+
+  const normalizedProcessing = processingApplied.filter(
+    (item): item is string => typeof item === "string",
+  );
+
+  return {
+    is_pixel_art: isPixelArt,
+    detected_palette_size: detectedPaletteSize,
+    processing_applied: normalizedProcessing,
+    original_bounds: originalBounds,
+    reframed_bounds: reframedBounds,
+  };
 }
 
 function compactJobRecordForStorage(record: JobRecord): JobRecord {
@@ -403,6 +472,29 @@ function App() {
   const [validationError, setValidationError] = useState<string>("");
   const [paletteUploadLoading, setPaletteUploadLoading] = useState<boolean>(false);
 
+  // Phase 1: Input conditioning state
+  const [sourceProcessingMode, setSourceProcessingMode] = useState<string>(
+    savedSettings.sourceProcessingMode ?? "detect",
+  );
+  const [reframeCanvasScaleX, setReframeCanvasScaleX] = useState<number>(
+    savedSettings.reframeCanvasScaleX ?? 1,
+  );
+  const [reframeCanvasScaleY, setReframeCanvasScaleY] = useState<number>(
+    savedSettings.reframeCanvasScaleY ?? 1,
+  );
+  const [refframeFillMode, setRefframeFillMode] = useState<string>(
+    savedSettings.refframeFillMode ?? "transparent",
+  );
+  const [reframeAnchorX, setReframeAnchorX] = useState<string>(
+    savedSettings.reframeAnchorX ?? "center",
+  );
+  const [reframeAnchorY, setReframeAnchorY] = useState<string>(
+    savedSettings.reframeAnchorY ?? "center",
+  );
+  const [motionSpaceHint, setMotionSpaceHint] = useState<string>(
+    savedSettings.motionSpaceHint ?? "auto",
+  );
+
   const [editorGrid, setEditorGrid] = useState<number>(savedSettings.editorGrid ?? 24);
   const [editorColor, setEditorColor] = useState<string>(savedSettings.editorColor ?? "#78b0a6");
   const [editorPixels, setEditorPixels] = useState<string[]>(
@@ -428,6 +520,7 @@ function App() {
   const availableCharacterDna = characterDna.length > 0 ? characterDna : DEFAULT_CHARACTER_DNA;
   const availableFormats = formats.length > 0 ? formats : DEFAULT_FORMATS;
   const frameScores = useMemo(() => getAnimationFrameScores(jobState.result?.metadata), [jobState.result?.metadata]);
+  const sourceAnalysis = useMemo(() => getSourceAnalysis(jobState.result?.metadata), [jobState.result?.metadata]);
   const avgFrameScore = useMemo(() => {
     if (frameScores.length === 0) {
       return null;
@@ -512,6 +605,13 @@ function App() {
       ppShadowReinforcement,
       ppHighlightReinforcement,
       ppPaletteStrictness,
+      sourceProcessingMode,
+      reframeCanvasScaleX,
+      reframeCanvasScaleY,
+      refframeFillMode,
+      reframeAnchorX,
+      reframeAnchorY,
+      motionSpaceHint,
       seed,
       cfgScale,
       enhancePrompt,
@@ -565,6 +665,13 @@ function App() {
     ppShadowReinforcement,
     ppHighlightReinforcement,
     ppPaletteStrictness,
+    sourceProcessingMode,
+    reframeCanvasScaleX,
+    reframeCanvasScaleY,
+    refframeFillMode,
+    reframeAnchorX,
+    reframeAnchorY,
+    motionSpaceHint,
     seed,
     cfgScale,
     enhancePrompt,
@@ -657,10 +764,13 @@ function App() {
   useEffect(() => {
     if (!availablePalettes.some((palette) => palette.id === palettePreset)) {
       const preferred = availablePalettes.find((palette) => palette.id === "steam_lords");
-      setPalettePreset(preferred ? preferred.id : availablePalettes[0]?.id ?? "custom");
-      if (preferred?.size) {
-        setPaletteSize(preferred.size);
-      }
+      // Defer state sync to avoid synchronous setState in effect body.
+      Promise.resolve().then(() => {
+        setPalettePreset(preferred ? preferred.id : availablePalettes[0]?.id ?? "custom");
+        if (preferred?.size) {
+          setPaletteSize(preferred.size);
+        }
+      });
     }
   }, [availablePalettes, palettePreset]);
 
@@ -670,7 +780,7 @@ function App() {
     }
 
     const controller = new AbortController();
-    setLibraryLoading(true);
+    Promise.resolve().then(() => setLibraryLoading(true));
 
     void fetchJobs({ search, signal: controller.signal })
       .then((jobs) => setLibraryJobs(jobs))
@@ -826,6 +936,16 @@ function App() {
       character_dna_id: characterDnaId || null,
       model_family: modelFamily,
       source_image_base64: sourceImageBase64,
+      // Phase 1: Input conditioning
+      source_processing_mode: sourceProcessingMode,
+      reframe: {
+        canvas_scale_x: reframeCanvasScaleX,
+        canvas_scale_y: reframeCanvasScaleY,
+        fill_mode: refframeFillMode,
+        anchor_x: reframeAnchorX,
+        anchor_y: reframeAnchorY,
+        preserve_bounds: true,
+      },
       tile_options: {
         tile_size: tileSize,
         seamless_mode: tileSeamless,
@@ -1363,6 +1483,86 @@ function App() {
               )}
             </div>
 
+            {/* Phase 1: Input conditioning controls */}
+            {sourceImageBase64 && (
+              <div className="subpanel">
+                <h3>Input Conditioning (Phase 1)</h3>
+
+                <label className="label">
+                  <span className="label-text">Processing Mode</span>
+                  <select value={sourceProcessingMode} onChange={(e) => setSourceProcessingMode(e.target.value)}>
+                    <option value="detect">Detect pixel art</option>
+                    <option value="pixelate">Pixelate (downscale)</option>
+                    <option value="reframe">Reframe canvas</option>
+                    <option value="none">No processing</option>
+                  </select>
+                </label>
+
+                {(sourceProcessingMode === "reframe" || sourceProcessingMode === "detect") && (
+                  <div className="nested-controls">
+                    <label className="label">
+                      <span className="label-text">Canvas Scale X: {reframeCanvasScaleX}×</span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="4"
+                        value={reframeCanvasScaleX}
+                        onChange={(e) => setReframeCanvasScaleX(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="label">
+                      <span className="label-text">Canvas Scale Y: {reframeCanvasScaleY}×</span>
+                      <input
+                        type="range"
+                        min="1"
+                        max="4"
+                        value={reframeCanvasScaleY}
+                        onChange={(e) => setReframeCanvasScaleY(Number(e.target.value))}
+                      />
+                    </label>
+
+                    <label className="label">
+                      <span className="label-text">Fill Mode</span>
+                      <select value={refframeFillMode} onChange={(e) => setRefframeFillMode(e.target.value)}>
+                        <option value="transparent">Transparent</option>
+                        <option value="color">Mid-gray</option>
+                        <option value="edge">Edge color</option>
+                      </select>
+                    </label>
+
+                    <div className="anchor-grid-label">Anchor Position</div>
+                    <div className="anchor-grid">
+                      {(["top", "center", "bottom"] as const).map((y) =>
+                        (["left", "center", "right"] as const).map((x) => (
+                          <button
+                            key={`${x}-${y}`}
+                            className={`anchor-button ${reframeAnchorX === x && reframeAnchorY === y ? "active" : ""}`}
+                            onClick={() => {
+                              setReframeAnchorX(x);
+                              setReframeAnchorY(y);
+                            }}
+                            title={`${x}-${y}`}
+                          >
+                            {x[0].toUpperCase()}{y[0].toUpperCase()}
+                          </button>
+                        )),
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <label className="label">
+                  <span className="label-text">Motion Space Hint</span>
+                  <select value={motionSpaceHint} onChange={(e) => setMotionSpaceHint(e.target.value)}>
+                    <option value="auto">Auto-detect</option>
+                    <option value="confined">Confined (e.g., small sprite)</option>
+                    <option value="moderate">Moderate (e.g., walk/run cycle)</option>
+                    <option value="open">Open (e.g., full-screen camera)</option>
+                  </select>
+                </label>
+              </div>
+            )}
+
             <div className="subpanel">
               <h3>Post-processing</h3>
               <p className="muted">
@@ -1652,6 +1852,33 @@ function App() {
               </div>
             </div>
 
+            {sourceAnalysis && (
+              <div className="source-analysis-card">
+                <p className="status-label">Source analysis</p>
+                <div className="source-analysis-grid">
+                  <p>
+                    Pixel art detected: <strong>{sourceAnalysis.is_pixel_art ? "Yes" : "No"}</strong>
+                  </p>
+                  <p>
+                    Palette size: <strong>{sourceAnalysis.detected_palette_size}</strong>
+                  </p>
+                  <p>
+                    Processing: <strong>{sourceAnalysis.processing_applied.join(", ") || "none"}</strong>
+                  </p>
+                  {sourceAnalysis.original_bounds && (
+                    <p>
+                      Original bounds: <strong>{sourceAnalysis.original_bounds.width}x{sourceAnalysis.original_bounds.height}</strong>
+                    </p>
+                  )}
+                  {sourceAnalysis.reframed_bounds && (
+                    <p>
+                      Reframed bounds: <strong>{sourceAnalysis.reframed_bounds.width}x{sourceAnalysis.reframed_bounds.height}</strong>
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
             {jobState.result?.frame_urls && jobState.result.frame_urls.length > 0 && (
               <div className="frame-preview-card">
                 <p className="status-label">Frames</p>
@@ -1859,7 +2086,7 @@ function rgbToHsl(r: number, g: number, b: number): { h: number; s: number; l: n
 
   const d = max - min;
   const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h = 0;
+  let h: number;
 
   switch (max) {
     case rn:

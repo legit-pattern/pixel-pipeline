@@ -99,6 +99,35 @@ export type PostProcessingInput = {
   pixelate_strength: number;
 };
 
+// Phase 1: Input conditioning types
+export type ReframeOptions = {
+  /** Horizontal scale factor (1-4x). Default: 1. */
+  canvas_scale_x?: number;
+  /** Vertical scale factor (1-4x). Default: 1. */
+  canvas_scale_y?: number;
+  /** Fill mode for expanded canvas: transparent|color|edge. Default: transparent. */
+  fill_mode?: string;
+  /** Horizontal anchor: left|center|right. Default: center. */
+  anchor_x?: string;
+  /** Vertical anchor: top|center|bottom. Default: center. */
+  anchor_y?: string;
+  /** Emit original bounds in metadata. Default: true. */
+  preserve_bounds?: boolean;
+};
+
+export type SourceAnalysis = {
+  /** Whether source image was detected as pixel art. */
+  is_pixel_art: boolean;
+  /** Approximate unique color count in source. */
+  detected_palette_size: number;
+  /** Original image dimensions if reframed. */
+  original_bounds?: { width: number; height: number };
+  /** New image dimensions after reframing. */
+  reframed_bounds?: { width: number; height: number };
+  /** Processing steps applied. */
+  processing_applied: string[];
+};
+
 export type GenerateRequest = {
   prompt: string;
   negative_prompt: string;
@@ -110,6 +139,9 @@ export type GenerateRequest = {
   tile_options: TileOptionsInput;
   post_processing: PostProcessingInput;
   source_image_base64: string | null;
+  // Phase 1: Input conditioning
+  source_processing_mode?: string; // none|detect|pixelate|reframe
+  reframe?: ReframeOptions;
   model_family: string;
   /** RNG seed. -1 = random. Set a fixed value to reproduce the same image. */
   seed: number;
@@ -167,7 +199,58 @@ export type JobStatus = {
   error?: { code?: string; message?: string };
 };
 
+type RawJobRecord = {
+  job_id?: unknown;
+  status?: unknown;
+  request?: unknown;
+  result?: unknown;
+  error?: unknown;
+  created_at?: unknown;
+  createdAt?: unknown;
+};
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim().replace(/\/+$/, "");
+
+function apiUrl(path: string): string {
+  if (!API_BASE_URL) {
+    return path;
+  }
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${API_BASE_URL}${normalizedPath}`;
+}
+
+function resolveBackendUrl(value: string | undefined): string | undefined {
+  if (!value) {
+    return value;
+  }
+  if (/^https?:\/\//i.test(value)) {
+    return value;
+  }
+  return apiUrl(value);
+}
+
+function normalizeJobResult(result: JobResult | undefined): JobResult | undefined {
+  if (!result) {
+    return result;
+  }
+  return {
+    ...result,
+    image_url: resolveBackendUrl(result.image_url),
+    spritesheet_url: resolveBackendUrl(result.spritesheet_url),
+    frame_urls: result.frame_urls?.map((item) => resolveBackendUrl(item) ?? item),
+    download: result.download
+      ? {
+          png_url: resolveBackendUrl(result.download.png_url),
+          webp_url: resolveBackendUrl(result.download.webp_url),
+          gif_url: resolveBackendUrl(result.download.gif_url),
+          spritesheet_png_url: resolveBackendUrl(result.download.spritesheet_png_url),
+          metadata_url: resolveBackendUrl(result.download.metadata_url),
+        }
+      : undefined,
+  };
+}
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -182,35 +265,35 @@ async function handleResponse<T>(res: Response): Promise<T> {
 
 export async function fetchModels(): Promise<ModelOption[]> {
   const data = await handleResponse<{ models: ModelOption[] }>(
-    await fetch("/api/pixel/models"),
+    await fetch(apiUrl("/api/pixel/models")),
   );
   return data.models;
 }
 
 export async function fetchPalettes(): Promise<PalettePreset[]> {
   const data = await handleResponse<{ palettes: PalettePreset[] }>(
-    await fetch("/api/pixel/palettes"),
+    await fetch(apiUrl("/api/pixel/palettes")),
   );
   return data.palettes;
 }
 
 export async function fetchAssetPresets(): Promise<AssetPreset[]> {
   const data = await handleResponse<{ presets: AssetPreset[] }>(
-    await fetch("/api/pixel/asset-presets"),
+    await fetch(apiUrl("/api/pixel/asset-presets")),
   );
   return data.presets;
 }
 
 export async function fetchCharacterDNA(): Promise<CharacterDNA[]> {
   const data = await handleResponse<{ character_dna: CharacterDNA[] }>(
-    await fetch("/api/pixel/character-dna"),
+    await fetch(apiUrl("/api/pixel/character-dna")),
   );
   return data.character_dna;
 }
 
 export async function fetchExportFormats(): Promise<ExportFormat[]> {
   const data = await handleResponse<{ formats: ExportFormat[] }>(
-    await fetch("/api/pixel/export-formats"),
+    await fetch(apiUrl("/api/pixel/export-formats")),
   );
   return data.formats;
 }
@@ -219,7 +302,7 @@ export async function submitGenerate(
   request: GenerateRequest,
 ): Promise<{ job_id: string; status: string }> {
   return handleResponse(
-    await fetch("/api/pixel/jobs/generate", {
+    await fetch(apiUrl("/api/pixel/jobs/generate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
@@ -228,11 +311,15 @@ export async function submitGenerate(
 }
 
 export async function pollJob(jobId: string): Promise<JobStatus> {
-  return handleResponse(await fetch(`/api/pixel/jobs/${jobId}`));
+  const status = await handleResponse<JobStatus>(await fetch(apiUrl(`/api/pixel/jobs/${jobId}`)));
+  return {
+    ...status,
+    result: normalizeJobResult(status.result),
+  };
 }
 
 export async function cancelJob(jobId: string): Promise<void> {
-  await fetch(`/api/pixel/jobs/${jobId}/cancel`, { method: "POST" });
+  await fetch(apiUrl(`/api/pixel/jobs/${jobId}/cancel`), { method: "POST" });
 }
 
 export async function fetchJobs(opts: {
@@ -240,13 +327,13 @@ export async function fetchJobs(opts: {
   search?: string;
   signal?: AbortSignal;
 }): Promise<JobRecord[]> {
-  const url = new URL("/api/pixel/jobs", window.location.origin);
+  const url = new URL(apiUrl("/api/pixel/jobs"), window.location.origin);
   url.searchParams.set("limit", String(opts.limit ?? 120));
   if (opts.search?.trim()) {
     url.searchParams.set("search", opts.search.trim());
   }
-  const data = await handleResponse<{ jobs: any[] }>(
-    await fetch(`${url.pathname}${url.search}`, { signal: opts.signal }),
+  const data = await handleResponse<{ jobs: unknown[] }>(
+    await fetch(url.toString(), { signal: opts.signal }),
   );
   return (data.jobs ?? []).map(normalizeJobRecord);
 }
@@ -262,7 +349,7 @@ export async function extractPaletteFromFile(
   const body = new FormData();
   body.append("file", file);
   return handleResponse(
-    await fetch("/api/pixel/palettes/from-image", {
+    await fetch(apiUrl("/api/pixel/palettes/from-image"), {
       method: "POST",
       body,
     }),
@@ -271,13 +358,14 @@ export async function extractPaletteFromFile(
 
 // ── record normalizer ─────────────────────────────────────────────────────────
 
-export function normalizeJobRecord(input: any): JobRecord {
+export function normalizeJobRecord(input: unknown): JobRecord {
+  const raw = (input && typeof input === "object" ? input : {}) as RawJobRecord;
   return {
-    job_id: String(input.job_id ?? ""),
-    status: String(input.status ?? "queued"),
-    request: input.request,
-    result: input.result ?? null,
-    error: input.error ?? null,
-    createdAt: String(input.created_at ?? input.createdAt ?? new Date().toISOString()),
+    job_id: String(raw.job_id ?? ""),
+    status: String(raw.status ?? "queued"),
+    request: (raw.request ?? {}) as GenerateRequest,
+    result: normalizeJobResult(raw.result as JobResult | undefined) ?? null,
+    error: (raw.error ?? null) as { code?: string; message?: string } | null,
+    createdAt: String(raw.created_at ?? raw.createdAt ?? new Date().toISOString()),
   };
 }

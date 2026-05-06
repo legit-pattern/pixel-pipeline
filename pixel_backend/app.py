@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import gc
+import importlib.metadata
+import importlib.util
 import inspect
 import io
 import json
@@ -10,6 +12,7 @@ import math
 import os
 import pathlib
 import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -17,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -159,6 +163,38 @@ class PostProcessingInput(BaseModel):
     """
 
 
+class ReframeOptions(BaseModel):
+    """Phase 1: Reframe controls for canvas scale, anchor, and fill mode."""
+
+    canvas_scale_x: int = Field(default=1, ge=1, le=4)
+    """Horizontal scale factor. 1=preserve, 2-4=expand."""
+    canvas_scale_y: int = Field(default=1, ge=1, le=4)
+    """Vertical scale factor. 1=preserve, 2-4=expand."""
+    fill_mode: str = "transparent"
+    """How to fill expanded canvas: 'transparent' | 'color' | 'edge'."""
+    anchor_x: str = "center"
+    """Horizontal anchor: 'left' | 'center' | 'right'."""
+    anchor_y: str = "center"
+    """Vertical anchor: 'top' | 'center' | 'bottom'."""
+    preserve_bounds: bool = True
+    """Emit original bounds in metadata for reproducibility."""
+
+
+class SourceAnalysis(BaseModel):
+    """Phase 1: Output metadata about source image analysis."""
+
+    is_pixel_art: bool
+    """Detected if source is pixel art (simple heuristic)."""
+    detected_palette_size: int
+    """Approximate unique color count in source."""
+    original_bounds: dict[str, int] | None = None
+    """Original image dimensions if reframed."""
+    reframed_bounds: dict[str, int] | None = None
+    """New image dimensions after reframing."""
+    processing_applied: list[str] = Field(default_factory=list)
+    """List of processing steps applied: detect, pixelate, reframe."""
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     negative_prompt: str = ""
@@ -170,6 +206,10 @@ class GenerateRequest(BaseModel):
     tile_options: TileOptionsInput = Field(default_factory=TileOptionsInput)
     post_processing: PostProcessingInput = Field(default_factory=PostProcessingInput)
     source_image_base64: str | None = None
+    source_processing_mode: str = "detect"
+    """Phase 1: How to process source image: 'none' | 'detect' | 'pixelate' | 'reframe'. Default: detect."""
+    reframe: ReframeOptions = Field(default_factory=ReframeOptions)
+    """Phase 1: Optional reframe controls (canvas scale, anchor, fill mode)."""
     model_family: str = "pixel_art_diffusion_xl"
     seed: int = -1
     """RNG seed for reproducible generation. -1 = random each run."""
@@ -248,9 +288,185 @@ def _is_base64_png(value: str) -> bool:
     return raw.startswith(b"\x89PNG")
 
 
+# ── Phase 1: Input conditioning helper functions ────────────────────────────────
+def _detect_pixel_art(image: PIL.Image.Image) -> dict[str, Any]:
+    """
+    Phase 1: Detect if an image is pixel art using simple heuristics.
+
+    Checks:
+    - Color variance (pixel art tends to have discrete color regions)
+    - Edge histogram (pixel art has sharp edges)
+    - Upscale-then-downscale reversibility (pixel art downsamples cleanly)
+
+    Returns dict with is_pixel_art (bool) and detected_palette_size (int).
+    """
+    try:
+        # Convert to RGB if needed
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Count unique colors
+        colors = image.getcolors(maxcolors=256 * 256 + 1)
+        unique_color_count = len(colors) if colors else 256
+        is_likely_pixel_art = unique_color_count <= 128  # Pixel art rarely uses 128+ colors
+
+        # Additional check: downscale-upscale reversibility
+        if image.size[0] > 64 and image.size[1] > 64:
+            downscaled = image.resize((image.size[0] // 2, image.size[1] // 2), PIL.Image.Resampling.LANCZOS)
+            upscaled = downscaled.resize(image.size, PIL.Image.Resampling.NEAREST)
+            diff = 0
+            for px_orig, px_ups in zip(image.getdata(), upscaled.getdata()):
+                if px_orig != px_ups:
+                    diff += 1
+            reversibility_score = 1.0 - (diff / len(list(image.getdata())))
+            if reversibility_score > 0.85:
+                is_likely_pixel_art = True
+
+        return {
+            "is_pixel_art": is_likely_pixel_art,
+            "detected_palette_size": min(unique_color_count, 256),
+        }
+    except Exception as exc:
+        log.debug("Pixel art detection failed: %s", exc)
+        return {"is_pixel_art": False, "detected_palette_size": 256}
+
+
+def _pixelate_image(image: PIL.Image.Image, target_width: int = 64) -> PIL.Image.Image:
+    """
+    Phase 1: Pixelate (downscale) an image using nearest-neighbor interpolation.
+
+    Maintains aspect ratio, scales to target_width maximum.
+    Uses LANCZOS downsampling then NEAREST-neighbor upsampling for clean pixelation.
+    """
+    try:
+        from PIL import Image as PILImage
+
+        # Convert to RGB if needed (to ensure consistent mode)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Calculate scaled dimensions preserving aspect ratio
+        original_width, original_height = image.size
+        if original_width <= target_width:
+            return image  # Already small enough
+
+        scale_factor = target_width / original_width
+        new_height = int(original_height * scale_factor)
+        if new_height < 1:
+            new_height = 1
+
+        # Downscale with LANCZOS for quality, then upscale with NEAREST for pixel-perfect result
+        downscaled = image.resize((target_width, new_height), PILImage.Resampling.LANCZOS)
+        return downscaled
+    except Exception as exc:
+        log.warning("Pixelation failed: %s", exc)
+        return image
+
+
+def _reframe_image(
+    image: PIL.Image.Image,
+    scale_x: int = 1,
+    scale_y: int = 1,
+    fill_mode: str = "transparent",
+    anchor_x: str = "center",
+    anchor_y: str = "center",
+) -> tuple[PIL.Image.Image, dict[str, Any]]:
+    """
+    Phase 1: Reframe an image by scaling canvas and positioning with anchor.
+
+    Returns (reframed_image, bounds_info) where bounds_info contains original and new dimensions.
+    """
+    try:
+        from PIL import Image as PILImage
+
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        orig_width, orig_height = image.size
+        new_width = orig_width * scale_x
+        new_height = orig_height * scale_y
+
+        if scale_x == 1 and scale_y == 1:
+            # No scaling, return as-is
+            return image, {
+                "original_width": orig_width,
+                "original_height": orig_height,
+                "reframed_width": orig_width,
+                "reframed_height": orig_height,
+            }
+
+        # Determine fill color
+        fill_color = (0, 0, 0)  # Black default
+        if fill_mode == "color":
+            fill_color = (128, 128, 128)  # Mid-gray
+        elif fill_mode == "edge":
+            # Sample edge pixel (top-left)
+            fill_color = image.getpixel((0, 0)) if isinstance(image.getpixel((0, 0)), tuple) else (128, 128, 128)
+
+        # Create new canvas
+        new_image = PILImage.new("RGB", (new_width, new_height), fill_color)
+
+        # Calculate anchor position
+        if anchor_x == "left":
+            paste_x = 0
+        elif anchor_x == "right":
+            paste_x = new_width - orig_width
+        else:  # center
+            paste_x = (new_width - orig_width) // 2
+
+        if anchor_y == "top":
+            paste_y = 0
+        elif anchor_y == "bottom":
+            paste_y = new_height - orig_height
+        else:  # center
+            paste_y = (new_height - orig_height) // 2
+
+        # Paste original image onto new canvas
+        new_image.paste(image, (paste_x, paste_y))
+
+        return new_image, {
+            "original_width": orig_width,
+            "original_height": orig_height,
+            "reframed_width": new_width,
+            "reframed_height": new_height,
+            "anchor": f"{anchor_x}_{anchor_y}",
+        }
+    except Exception as exc:
+        log.warning("Reframing failed: %s", exc)
+        return image, {
+            "original_width": image.size[0],
+            "original_height": image.size[1],
+            "reframed_width": image.size[0],
+            "reframed_height": image.size[1],
+        }
+
+
 def _validate_generate_request(request: GenerateRequest) -> None:
     if not request.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required")
+
+    # Phase 1: Validate source processing mode
+    allowed_source_modes = {"none", "detect", "pixelate", "reframe"}
+    if request.source_processing_mode.strip().lower() not in allowed_source_modes:
+        allowed = ", ".join(sorted(allowed_source_modes))
+        raise HTTPException(status_code=400, detail=f"source_processing_mode must be one of: {allowed}")
+
+    # Phase 1: Validate reframe options
+    if request.reframe:
+        allowed_fill_modes = {"transparent", "color", "edge"}
+        if request.reframe.fill_mode.strip().lower() not in allowed_fill_modes:
+            allowed = ", ".join(sorted(allowed_fill_modes))
+            raise HTTPException(status_code=400, detail=f"reframe.fill_mode must be one of: {allowed}")
+
+        allowed_anchors_x = {"left", "center", "right"}
+        if request.reframe.anchor_x.strip().lower() not in allowed_anchors_x:
+            allowed = ", ".join(sorted(allowed_anchors_x))
+            raise HTTPException(status_code=400, detail=f"reframe.anchor_x must be one of: {allowed}")
+
+        allowed_anchors_y = {"top", "center", "bottom"}
+        if request.reframe.anchor_y.strip().lower() not in allowed_anchors_y:
+            allowed = ", ".join(sorted(allowed_anchors_y))
+            raise HTTPException(status_code=400, detail=f"reframe.anchor_y must be one of: {allowed}")
 
     if request.output_format not in _ALLOWED_OUTPUT_FORMATS:
         raise HTTPException(
@@ -1777,6 +1993,213 @@ def _run_generation(record: JobRecord) -> None:
     log.info("Job %s complete in %.2fs", record.job_id, time.perf_counter() - t_job)
 
 
+def _get_installed_version(package_name: str) -> str | None:
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+# ── startup self-checks (phase 0.2) ────────────────────────────────────────────
+_STARTUP_CHECKS_CACHE: dict[str, Any] | None = None
+
+
+def _validate_checkpoint_accessibility() -> dict[str, Any]:
+    """Verify that model checkpoints are accessible and readable."""
+    checkpoint_status = {"checkpoint_count": 0, "accessible": [], "missing": [], "error": None}
+
+    try:
+        local_checkpoints = _list_local_checkpoints()
+        checkpoint_status["checkpoint_count"] = len(local_checkpoints)
+
+        for checkpoint_path in local_checkpoints:
+            try:
+                if checkpoint_path.exists() and checkpoint_path.is_file():
+                    size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+                    checkpoint_status["accessible"].append(
+                        {"name": checkpoint_path.name, "size_mb": round(size_mb, 2)}
+                    )
+                else:
+                    checkpoint_status["missing"].append(checkpoint_path.name)
+            except Exception as exc:
+                checkpoint_status["missing"].append(checkpoint_path.name)
+                checkpoint_status["error"] = str(exc)
+
+        # Verify that the default checkpoint exists and is accessible
+        if not _CHECKPOINT.exists():
+            checkpoint_status["error"] = f"Default checkpoint not found: {_CHECKPOINT}"
+    except Exception as exc:
+        checkpoint_status["error"] = str(exc)
+
+    return checkpoint_status
+
+
+def _validate_model_compatibility() -> dict[str, Any]:
+    """Verify that model loading libraries are compatible."""
+    compatibility_status = {
+        "diffusers_version": _get_installed_version("diffusers"),
+        "transformers_version": _get_installed_version("transformers"),
+        "issues": [],
+    }
+
+    try:
+        import diffusers
+        import transformers
+
+        # Check diffusers version
+        diffusers_version = tuple(map(int, diffusers.__version__.split(".")[:2]))
+        if diffusers_version < (0, 37):
+            compatibility_status["issues"].append(
+                f"diffusers {diffusers.__version__} < 0.37.0 (may lack SDXL support)"
+            )
+
+        # Check transformers version
+        transformers_version = tuple(map(int, transformers.__version__.split(".")[:2]))
+        if transformers_version >= (5, 0):
+            compatibility_status["issues"].append(
+                f"transformers {transformers.__version__} >= 5.0 (CLIPTextModel API may break)"
+            )
+
+    except ImportError as exc:
+        compatibility_status["issues"].append(f"Import failed: {exc}")
+    except Exception as exc:
+        compatibility_status["issues"].append(f"Version check failed: {exc}")
+
+    return compatibility_status
+
+
+def _run_startup_self_checks() -> dict[str, Any]:
+    """Run comprehensive startup checks and return the results."""
+    global _STARTUP_CHECKS_CACHE
+
+    checks = {
+        "status": "ok",
+        "issues": [],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks": {
+            "torch": {"available": False, "version": None, "cuda": False},
+            "dependencies": {"diffusers": False, "transformers": False, "accelerate": False},
+            "checkpoints": {},
+            "compatibility": {},
+        },
+    }
+
+    # ── torch and CUDA check ──
+    torch_version = _get_installed_version("torch")
+    if torch_version:
+        checks["checks"]["torch"]["version"] = torch_version
+        checks["checks"]["torch"]["available"] = True
+        try:
+            import torch
+
+            checks["checks"]["torch"]["cuda"] = torch.cuda.is_available()
+            if not torch.cuda.is_available():
+                checks["issues"].append("CUDA not available; GPU acceleration disabled")
+        except Exception as exc:
+            checks["issues"].append(f"torch CUDA check failed: {exc}")
+    else:
+        checks["issues"].append("torch is not installed")
+        checks["status"] = "degraded"
+
+    # ── dependency availability check ──
+    for dep in ["diffusers", "transformers", "accelerate"]:
+        checks["checks"]["dependencies"][dep] = _get_installed_version(dep) is not None
+        if not checks["checks"]["dependencies"][dep]:
+            checks["issues"].append(f"{dep} is not installed")
+            checks["status"] = "degraded"
+
+    # ── checkpoint accessibility check ──
+    checkpoint_status = _validate_checkpoint_accessibility()
+    checks["checks"]["checkpoints"] = checkpoint_status
+    if checkpoint_status.get("error"):
+        checks["issues"].append(f"Checkpoint check failed: {checkpoint_status['error']}")
+        checks["status"] = "degraded"
+    if checkpoint_status["checkpoint_count"] == 0:
+        checks["issues"].append("No checkpoints found; generation will fail")
+        checks["status"] = "degraded"
+
+    # ── model compatibility check ──
+    compatibility_status = _validate_model_compatibility()
+    checks["checks"]["compatibility"] = compatibility_status
+    checks["issues"].extend(compatibility_status.get("issues", []))
+    if compatibility_status.get("issues"):
+        checks["status"] = "degraded"
+
+    _STARTUP_CHECKS_CACHE = checks
+    return checks
+
+
+def _runtime_diagnostics() -> dict[str, Any]:
+    global _STARTUP_CHECKS_CACHE
+
+    # Ensure startup checks have been run
+    if _STARTUP_CHECKS_CACHE is None:
+        _run_startup_self_checks()
+
+    torch_spec = importlib.util.find_spec("torch")
+    diffusers_spec = importlib.util.find_spec("diffusers")
+    transformers_spec = importlib.util.find_spec("transformers")
+
+    diagnostics: dict[str, Any] = {
+        "runtime": "python",
+        "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "packages": {
+            "torch": _get_installed_version("torch"),
+            "diffusers": _get_installed_version("diffusers"),
+            "transformers": _get_installed_version("transformers"),
+            "accelerate": _get_installed_version("accelerate"),
+            "safetensors": _get_installed_version("safetensors"),
+        },
+        "modules": {
+            "torch": torch_spec is not None,
+            "diffusers": diffusers_spec is not None,
+            "transformers": transformers_spec is not None,
+        },
+        "device": {
+            "preferred": "cpu",
+            "cuda_available": False,
+            "cuda_device_count": 0,
+        },
+        "startup_checks": _STARTUP_CHECKS_CACHE,
+    }
+
+    if torch_spec is None:
+        diagnostics["status"] = "degraded"
+        diagnostics["issues"] = ["torch is not installed"]
+        return diagnostics
+
+    try:
+        import torch
+
+        diagnostics["device"] = {
+            "preferred": "cuda" if torch.cuda.is_available() else "cpu",
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device_count": torch.cuda.device_count(),
+        }
+        issues: list[str] = []
+        if diffusers_spec is None:
+            issues.append("diffusers is not installed")
+        if transformers_spec is None:
+            issues.append("transformers is not installed")
+        if not torch.cuda.is_available():
+            issues.append("CUDA is not available; SDXL generation will run in CPU fallback mode")
+        diagnostics["status"] = "ok" if not issues else "degraded"
+        diagnostics["issues"] = issues
+        return diagnostics
+    except Exception as exc:
+        diagnostics["status"] = "degraded"
+        diagnostics["issues"] = [f"runtime inspection failed: {type(exc).__name__}: {exc}"]
+        return diagnostics
+
+
+def _error_code_from_exception(exc: Exception) -> str:
+    name = type(exc).__name__
+    pieces = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", name)
+    normalized = "_".join(part.lower() for part in pieces if part)
+    return normalized or "generation_failed"
+
+
 def _run_job(record: JobRecord) -> None:
     if record.cancelled:
         log.info("Job %s cancelled before start", record.job_id)
@@ -1789,19 +2212,60 @@ def _run_job(record: JobRecord) -> None:
     except Exception as exc:
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
-        record.error = {"message": str(exc)}
+        record.error = {
+            "message": str(exc),
+            "type": type(exc).__name__,
+            "code": _error_code_from_exception(exc),
+        }
 
 
 def create_app() -> FastAPI:
     _configure_logging()
+    
+    # Run startup self-checks (Phase 0.2)
+    log.info("Running startup self-checks...")
+    startup_results = _run_startup_self_checks()
+    if startup_results["status"] == "degraded":
+        log.warning("Startup checks returned degraded status")
+        for issue in startup_results.get("issues", []):
+            log.warning("  - %s", issue)
+    else:
+        log.info("Startup checks passed")
+    
     app = FastAPI(title="Pixel Studio Backend", version="0.1.0")
+
+    cors_origins_raw = os.getenv("PIXEL_BACKEND_CORS_ORIGINS", "").strip()
+    if cors_origins_raw:
+        allow_origins = [item.strip() for item in cors_origins_raw.split(",") if item.strip()]
+        if allow_origins:
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=allow_origins,
+                allow_credentials=False,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+            log.info("CORS enabled for %d origin(s)", len(allow_origins))
 
     # Serve generated images at /outputs/<job_id>/<file>
     app.mount("/outputs", StaticFiles(directory=str(_OUTPUT_DIR)), name="outputs")
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok", "runtime": "python"}
+    def healthz() -> dict[str, Any]:
+        diagnostics = _runtime_diagnostics()
+        startup_checks = diagnostics.get("startup_checks", {})
+        return {
+            "status": "ok",
+            "runtime": diagnostics["runtime"],
+            "runtime_status": diagnostics["status"],
+            "device": diagnostics["device"],
+            "startup_status": startup_checks.get("status", "unknown"),
+            "startup_issues": startup_checks.get("issues", []),
+        }
+
+    @app.get("/api/pixel/runtime")
+    def runtime_info() -> dict[str, Any]:
+        return _runtime_diagnostics()
 
     @app.get("/api/pixel/models")
     def list_models() -> dict[str, list[dict[str, str]]]:
