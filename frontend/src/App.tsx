@@ -37,6 +37,10 @@ const SETTINGS_KEY = "pixel-studio-settings";
 const HISTORY_PERSIST_LIMIT = 24;
 const CLIP_TOKEN_LIMIT = 77;
 
+function sanitizeFilenamePart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "_").slice(0, 48) || "asset";
+}
+
 const TEMPLATES = {
   hero: "Create a single-frame game-ready pixel art main character sprite for an isometric 2.5D action RPG. Young male wanderer, practical layered traveler clothing, 3/4 view, neutral ready stance, clean pixel art, 64x64, transparent background, no text, no UI, no environment.",
   frog: "Create a game-ready pixel art enemy sprite sheet for an isometric 2.5D action RPG. Frog-like tower guardian scout, 12 frames total (4 idle, 4 walk, 4 attack), each 64x64, single-row spritesheet, transparent background, no text, no UI, no environment.",
@@ -541,6 +545,12 @@ function App() {
     const total = frameScores.reduce((acc, item) => acc + item.score, 0);
     return total / frameScores.length;
   }, [frameScores]);
+  const isGithubPagesFrontend = useMemo(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.location.hostname.endsWith("github.io");
+  }, []);
 
   const harmonizedPalette = useMemo(() => {
     return customColors
@@ -945,6 +955,7 @@ function App() {
       lane,
       output_mode: outputMode,
       output_format: outputFormat,
+      ephemeral_output: isGithubPagesFrontend,
       asset_preset: assetPreset,
       character_dna_id: characterDnaId || null,
       model_family: modelFamily,
@@ -1156,18 +1167,63 @@ function App() {
 
   function downloadLink(label: string, url?: string) {
     const disabled = !url;
+    const extension =
+      label === "PNG"
+        ? "png"
+        : label === "WebP"
+          ? "webp"
+          : label === "GIF"
+            ? "gif"
+            : label === "Sprite Sheet"
+              ? "png"
+              : "json";
+
+    async function triggerDownload(e: { preventDefault: () => void }) {
+      if (disabled || !url) {
+        e.preventDefault();
+        return;
+      }
+
+      e.preventDefault();
+      const baseName = sanitizeFilenamePart(prompt || lane);
+      const filename = `${baseName}_${label.toLowerCase().replace(/\s+/g, "_")}.${extension}`;
+
+      if (url.startsWith("data:")) {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        return;
+      }
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(objectUrl);
+      } catch {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+    }
+
     return (
       <a
         key={label}
         className={`download-pill${disabled ? " disabled" : ""}`}
         href={url || "#"}
-        target="_blank"
-        rel="noreferrer"
-        onClick={(e) => {
-          if (disabled) {
-            e.preventDefault();
-          }
-        }}
+        download
+        onClick={triggerDownload}
       >
         {label}
       </a>

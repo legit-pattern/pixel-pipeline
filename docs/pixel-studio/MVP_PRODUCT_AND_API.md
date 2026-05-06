@@ -222,6 +222,7 @@ Request body (Phase 1 extended with input conditioning):
     "pixelate_strength": 1.0
   },
   "source_image_base64": null,
+  "ephemeral_output": false,
   "model_family": "pixel_art_diffusion_xl",
   "auto_pipeline": true,
   "keyframe_first": false,
@@ -231,6 +232,13 @@ Request body (Phase 1 extended with input conditioning):
   "motion_prior": "auto"
 }
 ```
+
+`ephemeral_output` controls persistence behavior:
+
+- `false` (default): backend writes files under `/outputs/{job_id}` and returns `/outputs/...` URLs.
+- `true`: backend keeps output in-memory and returns data URLs (`data:*;base64,...`) for downloads and previews.
+
+Use `ephemeral_output=true` for hosted frontends (for example GitHub Pages) where backend disk persistence is not desired.
 
 `auto_pipeline=true` means the backend applies the recommended chain automatically:
 
@@ -445,6 +453,8 @@ Response body:
   "error": null
 }
 ```
+
+When `ephemeral_output=true`, `image_url`, `frame_urls`, and `result.download.*` may be data URLs instead of `/outputs/...` paths.
 
 ### Endpoint 3: Cancel Job
 

@@ -163,6 +163,8 @@ Required panels:
      - GIF
      - Sprite Sheet PNG
      - Metadata JSON
+   - downloads must trigger browser file download (`download` flow), not only open a new tab
+   - support both backend `/outputs/...` links and `data:*;base64,...` links
 
 4. Source analysis panel (when metadata includes `source_analysis`)
    - pixel-art detection (`is_pixel_art`)
@@ -203,6 +205,10 @@ Required features:
    - download links
 
 ## Prompt Guidance (UI Tips)
+
+## Hosted Frontend Runtime Note
+
+When frontend is served from GitHub Pages (`*.github.io`), generation requests should set `ephemeral_output=true` so backend returns in-memory data URLs and avoids writing to `pixel_output`.
 
 The frontend should show lightweight tips near the prompt box.
 

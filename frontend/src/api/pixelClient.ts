@@ -139,6 +139,7 @@ export type GenerateRequest = {
   tile_options: TileOptionsInput;
   post_processing: PostProcessingInput;
   source_image_base64: string | null;
+  ephemeral_output?: boolean;
   // Phase 1: Input conditioning
   source_processing_mode?: string; // none|detect|pixelate|reframe
   reframe?: ReframeOptions;

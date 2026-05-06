@@ -766,6 +766,45 @@ def test_job_success_payload_consistency(monkeypatch) -> None:
     assert isinstance(metadata.get("timing"), dict)
 
 
+def test_generate_accepts_ephemeral_output_flag(monkeypatch) -> None:
+    import pixel_backend.app as backend
+
+    seen_ephemeral_flag = {"value": None}
+
+    def fake_generation(record):
+        seen_ephemeral_flag["value"] = record.request.ephemeral_output
+        record.status = "success"
+        record.result = {
+            "download": {
+                "png_url": "data:image/png;base64,AAAA",
+                "spritesheet_png_url": "data:image/png;base64,AAAA",
+                "metadata_url": "data:application/json;base64,e30=",
+            },
+            "metadata": {
+                "timing": {
+                    "total_s": 0.1,
+                }
+            },
+        }
+
+    monkeypatch.setattr(backend, "_run_generation", fake_generation)
+
+    submit = client.post(
+        "/api/pixel/jobs/generate",
+        json={
+            "prompt": "ephemeral payload",
+            "ephemeral_output": True,
+        },
+    )
+    assert submit.status_code == 200
+    job_id = submit.json()["job_id"]
+
+    final_payload = _wait_for_terminal_status(job_id)
+    assert final_payload["status"] == "success"
+    assert seen_ephemeral_flag["value"] is True
+    assert final_payload["result"]["download"]["png_url"].startswith("data:image/png;base64,")
+
+
 def test_cancel_after_success_returns_terminal_success(monkeypatch) -> None:
     import pixel_backend.app as backend
 

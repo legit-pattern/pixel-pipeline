@@ -212,6 +212,8 @@ class GenerateRequest(BaseModel):
     tile_options: TileOptionsInput = Field(default_factory=TileOptionsInput)
     post_processing: PostProcessingInput = Field(default_factory=PostProcessingInput)
     source_image_base64: str | None = None
+    ephemeral_output: bool = False
+    """If true, do not persist outputs on disk; return downloadable data URLs instead."""
     source_processing_mode: str = "detect"
     """Phase 1: How to process source image: 'none' | 'detect' | 'pixelate' | 'reframe'. Default: detect."""
     reframe: ReframeOptions = Field(default_factory=ReframeOptions)
@@ -496,6 +498,17 @@ def _apply_source_processing(
 
     source_analysis["processing_applied"] = processing_applied
     return processed, SourceAnalysis(**source_analysis)
+
+
+def _to_data_url(content: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _image_to_data_url(image: PIL.Image.Image, fmt: str, mime_type: str, **save_kwargs: Any) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format=fmt, **save_kwargs)
+    return _to_data_url(buffer.getvalue(), mime_type)
 
 
 def _validate_generate_request(request: GenerateRequest) -> None:
@@ -1719,7 +1732,7 @@ def _enhance_prompt(
 
 
 def _run_generation(record: JobRecord) -> None:
-    """Execute the real SDXL generation and persist outputs."""
+    """Execute SDXL generation and produce either persisted files or ephemeral data URLs."""
     import torch
     from PIL import Image
 
@@ -1745,9 +1758,12 @@ def _run_generation(record: JobRecord) -> None:
         req.output_mode,
         req.output_format,
     )
-    job_dir = _OUTPUT_DIR / record.job_id
-    job_dir.mkdir(exist_ok=True)
-    log.info("Job %s output dir: %s", record.job_id, job_dir)
+    if req.ephemeral_output:
+        log.info("Job %s running with ephemeral output mode (no disk persistence)", record.job_id)
+    else:
+        job_dir = _OUTPUT_DIR / record.job_id
+        job_dir.mkdir(exist_ok=True)
+        log.info("Job %s output dir: %s", record.job_id, job_dir)
 
     # SDXL on CPU is unstable/heavy on many Windows setups and can crash the process.
     # Default behavior is to fail the job gracefully and keep the API alive.
@@ -1961,20 +1977,8 @@ def _run_generation(record: JobRecord) -> None:
         effective_cleanup,
     )
 
-    # ── save outputs ──────────────────────────────────────────────────────────
-    png_path = job_dir / "output.png"
+    # ── save/serialize outputs ───────────────────────────────────────────────
     t_save = time.perf_counter()
-    result_img.convert("RGBA").save(str(png_path), format="PNG")
-
-    webp_path = job_dir / "output.webp"
-    result_img.convert("RGBA").save(str(webp_path), format="WEBP", lossless=True)
-
-    gif_path = job_dir / "output.gif"
-    result_img.convert("RGB").convert("P", palette=Image.ADAPTIVE).save(
-        str(gif_path), format="GIF", save_all=False
-    )
-
-    spritesheet_path = job_dir / "output_sheet.png"
     frame_scores: list[dict[str, Any]] = []
     if req.keyframe_first and (req.sheet.columns * req.sheet.rows) > 1:
         from PIL import Image
@@ -2003,16 +2007,7 @@ def _run_generation(record: JobRecord) -> None:
             req.sheet.rows,
             req.sheet.padding,
         )
-    sheet_img.save(str(spritesheet_path), format="PNG")
-
-    frames_dir = job_dir / "frames"
-    frames_dir.mkdir(exist_ok=True)
     frame_urls: list[str] = []
-    for i, frame in enumerate(frames):
-        frame_name = f"frame_{i:03d}.png"
-        frame_path = frames_dir / frame_name
-        frame.save(str(frame_path), format="PNG")
-        frame_urls.append(f"/outputs/{record.job_id}/frames/{frame_name}")
 
     metadata = {
         "job_id": record.job_id,
@@ -2072,7 +2067,47 @@ def _run_generation(record: JobRecord) -> None:
     }
     if source_analysis is not None:
         metadata["source_analysis"] = source_analysis.model_dump()
-    meta_path = job_dir / "metadata.json"
+    png_image = result_img.convert("RGBA")
+    gif_image = result_img.convert("RGB").convert("P", palette=Image.ADAPTIVE)
+
+    if req.ephemeral_output:
+        png_url = _image_to_data_url(png_image, "PNG", "image/png")
+        webp_url = _image_to_data_url(png_image, "WEBP", "image/webp", lossless=True)
+        gif_url = _image_to_data_url(gif_image, "GIF", "image/gif", save_all=False)
+        spritesheet_png_url = _image_to_data_url(sheet_img, "PNG", "image/png")
+        frame_urls = [_image_to_data_url(frame, "PNG", "image/png") for frame in frames]
+        metadata_url = ""
+    else:
+        job_dir = _OUTPUT_DIR / record.job_id
+        job_dir.mkdir(exist_ok=True)
+
+        png_path = job_dir / "output.png"
+        png_image.save(str(png_path), format="PNG")
+
+        webp_path = job_dir / "output.webp"
+        png_image.save(str(webp_path), format="WEBP", lossless=True)
+
+        gif_path = job_dir / "output.gif"
+        gif_image.save(str(gif_path), format="GIF", save_all=False)
+
+        spritesheet_path = job_dir / "output_sheet.png"
+        sheet_img.save(str(spritesheet_path), format="PNG")
+
+        frames_dir = job_dir / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        for i, frame in enumerate(frames):
+            frame_name = f"frame_{i:03d}.png"
+            frame_path = frames_dir / frame_name
+            frame.save(str(frame_path), format="PNG")
+            frame_urls.append(f"/outputs/{record.job_id}/frames/{frame_name}")
+
+        base = f"/outputs/{record.job_id}"
+        png_url = f"{base}/output.png"
+        webp_url = f"{base}/output.webp"
+        gif_url = f"{base}/output.gif"
+        spritesheet_png_url = f"{base}/output_sheet.png"
+        metadata_url = f"{base}/metadata.json"
+
     timing["save_outputs_s"] = round(time.perf_counter() - t_save, 4)
     timing["total_s"] = round(time.perf_counter() - t_job, 4)
     if torch.cuda.is_available() and pipe.device.type == "cuda":
@@ -2083,29 +2118,32 @@ def _run_generation(record: JobRecord) -> None:
             timing["cuda_peak_allocated_mb"] = None
             timing["cuda_peak_reserved_mb"] = None
     metadata["timing"] = timing
-    meta_path.write_text(json.dumps(metadata, indent=2))
-    log.info("Job %s files saved in %.2fs", record.job_id, timing["save_outputs_s"])
+    if req.ephemeral_output:
+        metadata_url = _to_data_url(json.dumps(metadata, indent=2).encode("utf-8"), "application/json")
+    else:
+        meta_path = job_dir / "metadata.json"
+        meta_path.write_text(json.dumps(metadata, indent=2))
+        log.info("Job %s files saved in %.2fs", record.job_id, timing["save_outputs_s"])
 
-    base = f"/outputs/{record.job_id}"
     image_url_by_format = {
-        "png": f"{base}/output.png",
-        "webp": f"{base}/output.webp",
-        "gif": f"{base}/output.gif",
-        "spritesheet_png": f"{base}/output_sheet.png",
+        "png": png_url,
+        "webp": webp_url,
+        "gif": gif_url,
+        "spritesheet_png": spritesheet_png_url,
     }
     record.status = "success"
     record.result = {
-        "image_url": image_url_by_format.get(req.output_format, f"{base}/output.png"),
-        "spritesheet_url": f"{base}/output_sheet.png",
+        "image_url": image_url_by_format.get(req.output_format, png_url),
+        "spritesheet_url": spritesheet_png_url,
         "frame_urls": frame_urls,
         "seed": actual_seed,
         "enhanced_prompt": full_prompt,
         "download": {
-            "png_url": f"{base}/output.png",
-            "webp_url": f"{base}/output.webp",
-            "gif_url": f"{base}/output.gif",
-            "spritesheet_png_url": f"{base}/output_sheet.png",
-            "metadata_url": f"{base}/metadata.json",
+            "png_url": png_url,
+            "webp_url": webp_url,
+            "gif_url": gif_url,
+            "spritesheet_png_url": spritesheet_png_url,
+            "metadata_url": metadata_url,
         },
         "metadata": metadata,
     }
