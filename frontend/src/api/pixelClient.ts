@@ -211,8 +211,6 @@ type RawJobRecord = {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-const API_BASE_STORAGE_KEY = "pixel_api_base_url";
-
 function normalizeBaseUrl(value: string | null | undefined): string {
   return (value ?? "").trim().replace(/\/+$/, "");
 }
@@ -222,22 +220,10 @@ function getRuntimeApiBaseUrl(): string {
     return "";
   }
 
-  const params = new URLSearchParams(window.location.search);
-  const queryApi = normalizeBaseUrl(params.get("api"));
-  if (queryApi) {
-    try {
-      window.localStorage.setItem(API_BASE_STORAGE_KEY, queryApi);
-    } catch {
-      // Ignore storage errors and still use query value for this session.
-    }
-    return queryApi;
-  }
-
-  try {
-    return normalizeBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY));
-  } catch {
-    return "";
-  }
+  const runtimeConfig = (window as Window & {
+    __PIXEL_PIPELINE_RUNTIME__?: { apiBaseUrl?: string };
+  }).__PIXEL_PIPELINE_RUNTIME__;
+  return normalizeBaseUrl(runtimeConfig?.apiBaseUrl);
 }
 
 const API_BASE_URL =

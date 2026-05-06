@@ -39,6 +39,26 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Validate API base URL
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          if [ -z "$VITE_API_BASE_URL" ]; then
+            echo "VITE_API_BASE_URL is empty. Set it in: Settings -> Secrets and variables -> Actions -> Variables"
+            exit 1
+          fi
+
+      - name: Inject runtime API config
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          cat > public/runtime-config.js <<EOF
+          window.__PIXEL_PIPELINE_RUNTIME__ = {
+            apiBaseUrl: "$VITE_API_BASE_URL",
+          };
+          EOF
+
       - name: Build frontend
         working-directory: frontend
         env:
