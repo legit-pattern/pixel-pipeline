@@ -19,7 +19,9 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
+
+import PIL.Image
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +34,7 @@ _LOGGING_CONFIGURED = False
 # ── paths ──────────────────────────────────────────────────────────────────────
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _MODELS_DIR = _REPO_ROOT / "models"
+_DIFFUSERS_MODELS_DIR = _MODELS_DIR / "Diffusers"
 _OUTPUT_DIR = _REPO_ROOT / "pixel_output"
 _PALETTES_DIR = _REPO_ROOT / "pixel_backend" / "palettes"
 _ASSET_PRESETS_DIR = _REPO_ROOT / "pixel_backend" / "asset_presets"
@@ -223,6 +226,126 @@ def _log_gpu_stage(torch_module: Any, stage: str) -> None:
         )
     except Exception as exc:
         log.info("[gpu-diag] %s | probe_failed=%s", stage, exc)
+
+
+def _resolve_pipeline_load_dtype(torch_module: Any, execution_device: str) -> Any:
+    """Resolve dtype for checkpoint loading.
+
+    PIXEL_PIPELINE_LOAD_DTYPE values:
+    - auto (default): float16 on cuda, float32 on cpu
+    - float16
+    - float32
+    """
+    requested = os.getenv("PIXEL_PIPELINE_LOAD_DTYPE", "auto").strip().lower()
+    if requested in {"fp16", "float16", "half"}:
+        return torch_module.float16
+    if requested in {"fp32", "float32", "full"}:
+        return torch_module.float32
+    if requested not in {"", "auto"}:
+        log.warning("Unknown PIXEL_PIPELINE_LOAD_DTYPE=%s; using auto", requested)
+    return torch_module.float16 if execution_device == "cuda" else torch_module.float32
+
+
+def _resolve_use_safetensors() -> bool:
+    return _env_flag("PIXEL_USE_SAFETENSORS", default=True)
+
+
+def _resolve_disable_mmap() -> bool:
+    """Control safetensors mmap behavior when loading single-file checkpoints.
+
+    PIXEL_DISABLE_MMAP values:
+    - 1/true/yes/on: disable mmap
+    - 0/false/no/off: allow mmap
+
+    Default: False.
+    """
+    return _env_flag("PIXEL_DISABLE_MMAP", default=False)
+
+
+def _resolve_model_source() -> str:
+    """Resolve model load strategy.
+
+    PIXEL_MODEL_SOURCE values:
+    - auto (default): prefer a local Diffusers directory when available, else single_file
+    - diffusers: require a local Diffusers directory
+    - single_file: always use from_single_file
+    """
+    requested = os.getenv("PIXEL_MODEL_SOURCE", "auto").strip().lower()
+    if requested in {"", "auto", "diffusers", "single_file"}:
+        return requested or "auto"
+
+    log.warning("Unknown PIXEL_MODEL_SOURCE=%s; using auto", requested)
+    return "auto"
+
+
+def _looks_like_diffusers_model_dir(path: pathlib.Path) -> bool:
+    if not path.is_dir():
+        return False
+
+    required_files = [
+        path / "model_index.json",
+        path / "unet" / "config.json",
+        path / "vae" / "config.json",
+    ]
+    if not all(file_path.exists() for file_path in required_files):
+        return False
+
+    # Only treat as ready when core weights are present.
+    # This avoids auto-selecting partially downloaded Diffusers directories.
+    has_unet_weights = (
+        (path / "unet" / "diffusion_pytorch_model.bin").exists()
+        or (path / "unet" / "diffusion_pytorch_model.safetensors").exists()
+    )
+    has_vae_weights = (
+        (path / "vae" / "diffusion_pytorch_model.bin").exists()
+        or (path / "vae" / "diffusion_pytorch_model.safetensors").exists()
+    )
+    return has_unet_weights and has_vae_weights
+
+
+def _candidate_diffusers_dir_names(model_family: str, checkpoint_path: pathlib.Path, lora_file: str | None) -> list[str]:
+    names: list[str] = []
+
+    def add(name: str) -> None:
+        normalized = name.strip()
+        if normalized and normalized not in names:
+            names.append(normalized)
+
+    add(model_family)
+    add(checkpoint_path.stem)
+
+    if lora_file:
+        add("pixel_art_diffusion_xl")
+        add("sdxl_base")
+
+    return names
+
+
+def _resolve_diffusers_model_dir(
+    model_family: str,
+    checkpoint_path: pathlib.Path,
+    lora_file: str | None,
+) -> pathlib.Path | None:
+    explicit_dir = os.getenv("PIXEL_DIFFUSERS_MODEL_DIR", "").strip()
+    if explicit_dir:
+        explicit_path = pathlib.Path(explicit_dir).expanduser()
+        if _looks_like_diffusers_model_dir(explicit_path):
+            return explicit_path
+        if explicit_path.exists():
+            raise ValueError(
+                "PIXEL_DIFFUSERS_MODEL_DIR is set but does not look like a Diffusers model directory: "
+                f"{explicit_path}"
+            )
+        raise ValueError(f"PIXEL_DIFFUSERS_MODEL_DIR does not exist: {explicit_path}")
+
+    candidate_roots = [_DIFFUSERS_MODELS_DIR, _MODELS_DIR / "diffusers"]
+    for root in candidate_roots:
+        for candidate_name in _candidate_diffusers_dir_names(model_family, checkpoint_path, lora_file):
+            candidate_path = root / candidate_name
+            if _looks_like_diffusers_model_dir(candidate_path):
+                return candidate_path
+
+    return None
 
 
 class PaletteInput(BaseModel):
@@ -549,14 +672,9 @@ def _detect_pixel_art(image: PIL.Image.Image) -> dict[str, Any]:
 
         # Additional check: downscale-upscale reversibility
         if image.size[0] > 64 and image.size[1] > 64:
-            downscaled = image.resize((image.size[0] // 2, image.size[1] // 2), PIL.Image.Resampling.LANCZOS)
-            upscaled = downscaled.resize(image.size, PIL.Image.Resampling.NEAREST)
-            diff = 0
-            for px_orig, px_ups in zip(image.getdata(), upscaled.getdata()):
-                if px_orig != px_ups:
-                    diff += 1
-            reversibility_score = 1.0 - (diff / len(list(image.getdata())))
-            if reversibility_score > 0.85:
+            # Histogram sparsity is a cheap proxy for quantized/pixel-art-like sources.
+            non_zero_bins = sum(1 for value in image.histogram() if value)
+            if non_zero_bins <= 192:
                 is_likely_pixel_art = True
 
         return {
@@ -1132,7 +1250,10 @@ def _resolve_character_dna_context(character_dna_id: str | None) -> dict[str, An
 def _resolve_effective_post_processing(req: GenerateRequest, preset_ctx: dict[str, Any]) -> dict[str, Any]:
     default_pp = PostProcessingInput().model_dump()
     user_pp = req.post_processing.model_dump()
-    preset_pp = preset_ctx.get("post_processing") if isinstance(preset_ctx.get("post_processing"), dict) else {}
+    preset_pp = cast(
+        dict[str, Any],
+        preset_ctx.get("post_processing") if isinstance(preset_ctx.get("post_processing"), dict) else {},
+    )
 
     # Override hierarchy:
     # 1) framework defaults
@@ -1170,15 +1291,93 @@ def _resolve_model_spec(model_family: str) -> tuple[pathlib.Path, str | None]:
     return checkpoint_path, lora_file
 
 
+def _load_pipeline_from_diffusers_dir(
+    pipeline_cls: Any,
+    diffusers_dir: pathlib.Path,
+    dtype: Any,
+    model_family: str,
+    checkpoint_path: pathlib.Path,
+) -> Any:
+    t0 = time.perf_counter()
+    log.info(
+        "Loading SDXL pipeline from Diffusers directory (model_family=%s, source=%s, fallback_checkpoint=%s)",
+        model_family,
+        diffusers_dir,
+        checkpoint_path.name,
+    )
+    pipe = pipeline_cls.from_pretrained(
+        str(diffusers_dir),
+        torch_dtype=dtype,
+        use_safetensors=True,
+    )
+    log.info("Diffusers pipeline loaded in %.2fs", time.perf_counter() - t0)
+    return pipe
+
+
+def _load_pipeline_from_single_file(
+    pipeline_cls: Any,
+    checkpoint_path: pathlib.Path,
+    dtype: Any,
+    use_safetensors: bool,
+    disable_mmap: bool,
+    device: str,
+    model_family: str,
+    torch_module: Any,
+) -> Any:
+    t0 = time.perf_counter()
+    log.info(
+        "Loading SDXL checkpoint onto %s (model_family=%s, checkpoint=%s, dtype=%s, safetensors=%s, disable_mmap=%s)",
+        device,
+        model_family,
+        checkpoint_path.name,
+        "float16" if dtype == torch_module.float16 else "float32",
+        use_safetensors,
+        disable_mmap,
+    )
+    _log_gpu_stage(torch_module, "before_from_single_file")
+    pipe = pipeline_cls.from_single_file(
+        str(checkpoint_path),
+        torch_dtype=dtype,
+        use_safetensors=use_safetensors,
+        disable_mmap=disable_mmap,
+    )
+    _log_gpu_stage(torch_module, "after_from_single_file")
+    log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
+    return pipe
+
+
 def _load_pipeline(model_family: str) -> Any:
     """Load (and cache) an SDXL pipeline for the requested model family."""
     import torch
-    from diffusers import StableDiffusionXLPipeline
+    from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import (
+        StableDiffusionXLPipeline,
+    )
 
     checkpoint_path, lora_file = _resolve_model_spec(model_family)
-    cache_key = f"{checkpoint_path}|{lora_file or ''}"
+    requested_model_source = _resolve_model_source()
+    diffusers_dir = _resolve_diffusers_model_dir(model_family, checkpoint_path, lora_file)
+
+    if requested_model_source == "diffusers":
+        if diffusers_dir is None:
+            raise ValueError(
+                "PIXEL_MODEL_SOURCE=diffusers requires a local Diffusers model directory. "
+                "Set PIXEL_DIFFUSERS_MODEL_DIR or add a model under models/Diffusers/."
+            )
+        selected_model_source = "diffusers"
+    elif requested_model_source == "single_file":
+        selected_model_source = "single_file"
+    else:
+        selected_model_source = "diffusers" if diffusers_dir is not None else "single_file"
+
+    source_ref = diffusers_dir if selected_model_source == "diffusers" else checkpoint_path
+    cache_key = f"{selected_model_source}:{source_ref}|{lora_file or ''}"
     if cache_key in _PIPELINE_CACHE:
-        log.info("Pipeline cache hit for model_family=%s checkpoint=%s", model_family, checkpoint_path.name)
+        log.info(
+            "Pipeline cache hit for model_family=%s source=%s ref=%s",
+            model_family,
+            selected_model_source,
+            source_ref,
+        )
         return _PIPELINE_CACHE[cache_key]
 
     # Keep only one active pipeline in memory. Switching profile/checkpoint can otherwise
@@ -1196,22 +1395,30 @@ def _load_pipeline(model_family: str) -> Any:
             torch.cuda.empty_cache()
 
     device = _resolve_execution_device(torch)
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    dtype = _resolve_pipeline_load_dtype(torch, device)
+    use_safetensors = _resolve_use_safetensors()
+    disable_mmap = _resolve_disable_mmap()
 
-    t0 = time.perf_counter()
-    log.info(
-        "Loading SDXL checkpoint onto %s (model_family=%s, checkpoint=%s)",
-        device,
-        model_family,
-        checkpoint_path.name,
-    )
-    _log_gpu_stage(torch, "before_from_single_file")
-    pipe = StableDiffusionXLPipeline.from_single_file(
-        str(checkpoint_path),
-        torch_dtype=dtype,
-        use_safetensors=True,
-    )
-    _log_gpu_stage(torch, "after_from_single_file")
+    if selected_model_source == "diffusers":
+        assert diffusers_dir is not None
+        pipe = _load_pipeline_from_diffusers_dir(
+            StableDiffusionXLPipeline,
+            diffusers_dir,
+            dtype,
+            model_family,
+            checkpoint_path,
+        )
+    else:
+        pipe = _load_pipeline_from_single_file(
+            StableDiffusionXLPipeline,
+            checkpoint_path,
+            dtype,
+            use_safetensors,
+            disable_mmap,
+            device,
+            model_family,
+            torch,
+        )
     if device == "cuda":
         # Prefer sequential offload on 12GB cards: slower, but significantly lower peak VRAM.
         # Do NOT call pipe.to("cuda") before offload; hooks manage placement automatically.
@@ -1245,7 +1452,7 @@ def _load_pipeline(model_family: str) -> Any:
         pipe.vae.enable_tiling()
     _log_gpu_stage(torch, "after_vae_setup")
     pipe.set_progress_bar_config(disable=False)
-    log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
+    log.info("Pipeline ready (model_family=%s, source=%s)", model_family, selected_model_source)
 
     if lora_file:
         lora_path = _MODELS_DIR / "Lora" / lora_file
@@ -2186,7 +2393,9 @@ def _run_generation(record: JobRecord) -> None:
     result_img = None
     if init_image is not None:
         try:
-            from diffusers import StableDiffusionXLImg2ImgPipeline
+            from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
+                StableDiffusionXLImg2ImgPipeline,
+            )
 
             t_img2img = time.perf_counter()
             log.info("Job %s starting img2img inference", record.job_id)
@@ -2210,7 +2419,8 @@ def _run_generation(record: JobRecord) -> None:
                 "generator": generator,
             }
             img2img_kwargs = _with_progress_callbacks(img2img.__call__, img2img_kwargs)
-            result_img = img2img(**img2img_kwargs).images[0]
+            img2img_out = cast(Any, img2img(**img2img_kwargs))
+            result_img = img2img_out.images[0]
             timing["inference_s"] = round(time.perf_counter() - t_img2img, 4)
             timing["inference_mode"] = "img2img"
             log.info("Job %s img2img finished in %.2fs", record.job_id, timing["inference_s"])
@@ -2348,7 +2558,7 @@ def _run_generation(record: JobRecord) -> None:
     if source_analysis is not None:
         metadata["source_analysis"] = source_analysis.model_dump()
     png_image = result_img.convert("RGBA")
-    gif_image = result_img.convert("RGB").convert("P", palette=Image.ADAPTIVE)
+    gif_image = result_img.convert("RGB").convert("P", palette=Image.Palette.ADAPTIVE)
 
     if req.ephemeral_output:
         png_url = _image_to_data_url(png_image, "PNG", "image/png")
@@ -2401,7 +2611,7 @@ def _run_generation(record: JobRecord) -> None:
     if req.ephemeral_output:
         metadata_url = _to_data_url(json.dumps(metadata, indent=2).encode("utf-8"), "application/json")
     else:
-        meta_path = job_dir / "metadata.json"
+        meta_path = (_OUTPUT_DIR / record.job_id) / "metadata.json"
         meta_path.write_text(json.dumps(metadata, indent=2))
         log.info("Job %s files saved in %.2fs", record.job_id, timing["save_outputs_s"])
 
@@ -2640,6 +2850,11 @@ def _runtime_diagnostics() -> dict[str, Any]:
             "execution_device_request": os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
             "cuda_offload_mode": os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential"),
             "gpu_diagnostics_enabled": _gpu_diag_enabled(),
+            "model_source": _resolve_model_source(),
+            "diffusers_model_dir": os.getenv("PIXEL_DIFFUSERS_MODEL_DIR", ""),
+            "pipeline_load_dtype": os.getenv("PIXEL_PIPELINE_LOAD_DTYPE", "auto"),
+            "pipeline_use_safetensors": _resolve_use_safetensors(),
+            "pipeline_disable_mmap": _resolve_disable_mmap(),
         }
         issues: list[str] = []
         if diffusers_spec is None:
@@ -2657,7 +2872,7 @@ def _runtime_diagnostics() -> dict[str, Any]:
         return diagnostics
 
 
-def _error_code_from_exception(exc: Exception) -> str:
+def _error_code_from_exception(exc: BaseException) -> str:
     name = type(exc).__name__
     pieces = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", name)
     normalized = "_".join(part.lower() for part in pieces if part)
@@ -2687,7 +2902,7 @@ def _run_job(record: JobRecord) -> None:
             record.result = None
             record.error = None
             log.info("Job %s marked cancelled after generation return", record.job_id)
-    except Exception as exc:
+    except BaseException as exc:
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
         record.phase = "failed"
@@ -2757,7 +2972,7 @@ def create_app() -> FastAPI:
             response = await call_next(request)
 
         if origin_allowed:
-            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Origin"] = origin or ""
             response.headers["Vary"] = "Origin"
             response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
             requested_headers = request.headers.get("access-control-request-headers")
@@ -2796,7 +3011,7 @@ def create_app() -> FastAPI:
             # ── pixel-art checkpoints (style baked in, no pixel-art LoRA needed) ─
             {
                 "id": "pixel_art_diffusion_xl",
-                "label": "Pixel Art Diffusion XL SpriteShaper ★ Recommended",
+                "label": "Pixel Art Diffusion XL SpriteShaper ★",
                 "quality": "pixel-checkpoint",
             },
             # ── sdxl_base + pixel-art LoRAs ─────────────────────────────────────
@@ -3033,8 +3248,9 @@ def create_app() -> FastAPI:
             )
 
         # Sort by descending frequency, then by colour value for stable ordering
-        color_data.sort(key=lambda item: (-item[0], item[1]))
-        hex_colors = [f"#{r:02x}{g:02x}{b:02x}" for _, (r, g, b) in color_data]
+        typed_color_data = cast(list[tuple[int, tuple[int, int, int]]], color_data)
+        typed_color_data.sort(key=lambda item: (-item[0], item[1]))
+        hex_colors = [f"#{r:02x}{g:02x}{b:02x}" for _, (r, g, b) in typed_color_data]
         return {"colors": hex_colors, "count": len(hex_colors)}
 
     return app

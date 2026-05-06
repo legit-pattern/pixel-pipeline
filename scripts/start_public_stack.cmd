@@ -9,7 +9,11 @@ for %%I in ("%ROOT_DIR%") do set "ROOT_DIR=%%~fI"
 if "%PAGES_ORIGIN%"=="" set "PAGES_ORIGIN=https://legit-pattern.github.io"
 if "%BACKEND_PORT%"=="" set "BACKEND_PORT=48617"
 if "%BACKEND_HOST%"=="" set "BACKEND_HOST=0.0.0.0"
+if "%PIXEL_GPU_DIAGNOSTICS%"=="" set "PIXEL_GPU_DIAGNOSTICS=1"
+if "%PIXEL_MODEL_SOURCE%"=="" set "PIXEL_MODEL_SOURCE=single_file"
 echo [1/4] Using fixed backend port !BACKEND_PORT!
+echo [1.1/4] GPU diagnostics: !PIXEL_GPU_DIAGNOSTICS! ^(set PIXEL_GPU_DIAGNOSTICS=0 to disable^)
+echo [1.2/4] Model source: !PIXEL_MODEL_SOURCE! ^(single_file uses models/Stable-diffusion checkpoint^)
 
 echo [2/4] Resolving runtime commands...
 echo Starting public stack for Pixel Pipeline
