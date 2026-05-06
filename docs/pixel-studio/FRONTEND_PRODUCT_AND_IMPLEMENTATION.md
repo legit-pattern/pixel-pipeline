@@ -96,6 +96,10 @@ Required controls:
 6. Source image
    - optional PNG upload
    - preview + remove action
+   - input conditioning section visible when source image exists:
+     - source processing mode selector (`detect`, `pixelate`, `reframe`, `none`)
+     - reframe controls (canvas scale x/y in 1-4 range, fill mode, 3x3 anchor selector)
+     - motion space hint selector (`auto`, `confined`, `moderate`, `open`)
 
 7. Submit area
    - generation cost/tip hint
@@ -159,6 +163,12 @@ Required panels:
      - GIF
      - Sprite Sheet PNG
      - Metadata JSON
+
+4. Source analysis panel (when metadata includes `source_analysis`)
+   - pixel-art detection (`is_pixel_art`)
+   - detected palette size (`detected_palette_size`)
+   - processing steps (`processing_applied`)
+   - original/reframed bounds when available
 
 ## Library Screen Specification
 

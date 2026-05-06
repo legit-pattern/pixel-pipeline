@@ -35,6 +35,7 @@ const STORAGE_KEY = "pixel-studio-job-history";
 const STARS_KEY = "pixel-studio-starred-jobs";
 const SETTINGS_KEY = "pixel-studio-settings";
 const HISTORY_PERSIST_LIMIT = 24;
+const CLIP_TOKEN_LIMIT = 77;
 
 const TEMPLATES = {
   hero: "Create a single-frame game-ready pixel art main character sprite for an isometric 2.5D action RPG. Young male wanderer, practical layered traveler clothing, 3/4 view, neutral ready stance, clean pixel art, 64x64, transparent background, no text, no UI, no environment.",
@@ -279,6 +280,17 @@ function getSourceAnalysis(metadata: unknown): SourceAnalysis | null {
   };
 }
 
+function estimateClipTokenCount(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return 0;
+  }
+
+  // Rough estimate for CLIP BPE-like tokenization (words + punctuation).
+  const matches = trimmed.match(/[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/g);
+  return matches?.length ?? 0;
+}
+
 function compactJobRecordForStorage(record: JobRecord): JobRecord {
   return {
     ...record,
@@ -520,6 +532,8 @@ function App() {
   const availableFormats = formats.length > 0 ? formats : DEFAULT_FORMATS;
   const frameScores = useMemo(() => getAnimationFrameScores(jobState.result?.metadata), [jobState.result?.metadata]);
   const sourceAnalysis = useMemo(() => getSourceAnalysis(jobState.result?.metadata), [jobState.result?.metadata]);
+  const promptTokenEstimate = useMemo(() => estimateClipTokenCount(prompt), [prompt]);
+  const negativePromptTokenEstimate = useMemo(() => estimateClipTokenCount(negativePrompt), [negativePrompt]);
   const avgFrameScore = useMemo(() => {
     if (frameScores.length === 0) {
       return null;
@@ -1234,6 +1248,10 @@ function App() {
               Prompt *
               <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={5} />
             </label>
+            <p className={promptTokenEstimate > CLIP_TOKEN_LIMIT ? "error" : "muted"}>
+              CLIP limit: max {CLIP_TOKEN_LIMIT} tokens per prompt field. Current prompt (estimate): {promptTokenEstimate}. Text above the limit can be truncated by the model.
+              {enhancePrompt ? " Auto-enhance adds extra tags, so keep some margin." : ""}
+            </p>
 
             <div className="template-row">
               <button onClick={() => setTemplate("hero")}>Character template</button>
@@ -1244,6 +1262,9 @@ function App() {
               Negative prompt
               <textarea value={negativePrompt} onChange={(e) => setNegativePrompt(e.target.value)} rows={3} />
             </label>
+            <p className={negativePromptTokenEstimate > CLIP_TOKEN_LIMIT ? "error" : "muted"}>
+              Negative prompt (estimate): {negativePromptTokenEstimate}/{CLIP_TOKEN_LIMIT} tokens.
+            </p>
 
             <div className="inline-grid three">
               <label>

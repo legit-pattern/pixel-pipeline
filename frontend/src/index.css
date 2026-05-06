@@ -295,6 +295,23 @@ textarea {
   border-radius: 8px;
 }
 
+.source-analysis-card {
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+
+.source-analysis-grid {
+  display: grid;
+  gap: 0.45rem;
+  font-size: 0.88rem;
+}
+
+.source-analysis-grid p {
+  margin: 0;
+}
+
 .frame-score-card {
   margin-top: 1rem;
   padding: 0.75rem 1rem;
@@ -699,6 +716,66 @@ textarea {
 button:hover,
 .download-pill:hover {
   transform: translateY(-1px);
+  border-color: var(--accent);
+}
+
+/* Phase 1: Input conditioning styles */
+.label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.label-text {
+  font-weight: 500;
+}
+
+.nested-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 8px 0 8px 12px;
+  border-left: 2px solid var(--accent);
+}
+
+.anchor-grid-label {
+  font-size: 0.9rem;
+  color: var(--muted);
+  font-weight: 500;
+  margin-top: 2px;
+}
+
+.anchor-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.anchor-button {
+  padding: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 500;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.anchor-button:hover {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+
+.anchor-button.active {
+  background: var(--accent);
+  color: #f9fefc;
   border-color: var(--accent);
 }
 

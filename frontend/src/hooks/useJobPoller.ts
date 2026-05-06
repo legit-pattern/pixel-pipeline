@@ -90,6 +90,23 @@ export function useJobPoller(
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Polling failed";
+      if (message.includes("HTTP 404")) {
+        // Backend job store is in-memory; old ids can disappear after restart.
+        activeJobIdRef.current = "";
+        setState((prev) => ({
+          ...prev,
+          status: "cancelled",
+          errorMessage: "Job no longer exists on backend (likely after server restart).",
+        }));
+        onJobUpdate({
+          job_id: jobId,
+          status: "cancelled",
+          result: undefined,
+          error: { code: "job_not_found", message: "job not found" },
+        });
+        return;
+      }
+
       setState((prev) => ({ ...prev, status: "failure", errorMessage: message }));
     }
   }

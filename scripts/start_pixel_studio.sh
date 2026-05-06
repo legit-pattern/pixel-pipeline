@@ -7,6 +7,7 @@ BACKEND_PORT="${BACKEND_PORT:-7861}"
 BACKEND_RELOAD="${BACKEND_RELOAD:-0}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+BACKEND_STARTUP_TIMEOUT="${BACKEND_STARTUP_TIMEOUT:-60}"
 
 BACKEND_PYTHON_CMD=()
 BACKEND_PYTHON_LABEL=""
@@ -54,6 +55,38 @@ fi
 ) &
 BACKEND_PID=$!
 
+wait_for_backend_ready() {
+  local waited=0
+  local health_url="http://${BACKEND_HOST}:${BACKEND_PORT}/healthz"
+
+  printf "Waiting for backend readiness at %s" "$health_url"
+  while (( waited < BACKEND_STARTUP_TIMEOUT )); do
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+      printf "\nBackend process exited during startup.\n"
+      return 1
+    fi
+
+    if "${BACKEND_PYTHON_CMD[@]}" - <<'PY' "$health_url" >/dev/null 2>&1; then
+import sys
+import urllib.request
+
+url = sys.argv[1]
+with urllib.request.urlopen(url, timeout=1) as response:
+    raise SystemExit(0 if response.status == 200 else 1)
+PY
+      printf " ready.\n"
+      return 0
+    fi
+
+    printf "."
+    sleep 1
+    ((waited += 1))
+  done
+
+  printf "\nBackend did not become ready within %ss.\n" "$BACKEND_STARTUP_TIMEOUT"
+  return 1
+}
+
 _cleaned_up=0
 cleanup() {
   if [[ "$_cleaned_up" == "1" ]]; then
@@ -64,6 +97,10 @@ cleanup() {
   kill "$BACKEND_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+
+if ! wait_for_backend_ready; then
+  exit 1
+fi
 
 printf "Starting frontend on %s:%s...\n" "$FRONTEND_HOST" "$FRONTEND_PORT"
 cd "$ROOT_DIR/frontend"
