@@ -1,0 +1,19 @@
+{
+  "id": "tile",
+  "label": "Tile",
+  "prompt_tags": [
+    "tileable",
+    "seamless edges",
+    "uniform edge readability"
+  ],
+  "post_processing": {
+    "pixel_cleanup": true,
+    "outline_strength": 0,
+    "anti_alias_level": 1,
+    "cluster_smoothing": 2,
+    "contrast_boost": 0,
+    "shadow_reinforcement": 0,
+    "highlight_reinforcement": 0,
+    "palette_strictness": 1
+  }
+}

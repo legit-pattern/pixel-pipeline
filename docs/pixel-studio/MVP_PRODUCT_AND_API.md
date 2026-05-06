@@ -85,6 +85,7 @@ Additional required behavior:
 
 - color count quick selector (for example 8, 16, 24, 32)
 - optional manual hex palette input mode
+- palette presets are profile resources (id + colors + metadata like dither/style/outline)
 
 Recommended presets:
 
@@ -175,22 +176,68 @@ Request body:
   "lane": "sprite",
   "output_mode": "spritesheet",
   "output_format": "spritesheet_png",
+  "asset_preset": "auto",
+  "character_dna_id": null,
   "palette": {
     "preset": "custom",
     "size": 16,
     "colors": ["#101418", "#2b3a67", "#5fa8d3", "#f9f7f3"]
   },
   "sheet": {
-    "frame_width": 32,
-    "frame_height": 32,
+    "frame_width": 64,
+    "frame_height": 64,
     "columns": 4,
     "rows": 1,
     "padding": 0
   },
+  "tile_options": {
+    "tile_size": 64,
+    "seamless_mode": false,
+    "autotile_mask": "none",
+    "variation_count": 1,
+    "noise_level": 0,
+    "edge_softening": 0
+  },
+  "post_processing": {
+    "pixelate": false,
+    "remove_background": false,
+    "quantize_palette": false,
+    "pixel_cleanup": false,
+    "outline_strength": 1,
+    "anti_alias_level": 1,
+    "cluster_smoothing": 1,
+    "contrast_boost": 0,
+    "shadow_reinforcement": 0,
+    "highlight_reinforcement": 0,
+    "palette_strictness": 1,
+    "pixelate_strength": 1.0
+  },
   "source_image_base64": null,
-  "model_family": "oai_gpt2_low"
+  "model_family": "pixel_art_diffusion_xl",
+  "auto_pipeline": true,
+  "keyframe_first": false,
+  "variation_strength": 0.35,
+  "consistency_threshold": 0.65,
+  "frame_retry_budget": 2,
+  "motion_prior": "auto"
 }
 ```
+
+`auto_pipeline=true` means the backend applies the recommended chain automatically:
+
+- generate at 8x target frame size (aligned to SDXL-safe dimensions)
+- pixel snap/downscale pass
+- palette quantization when custom palette colors are provided
+
+Keyframe-first controls are optional and only apply when output has multiple frames:
+
+- `keyframe_first`: generate a single keyframe first, then derive the remaining frames.
+- `variation_strength`: how far derived frames may deviate from the keyframe.
+- `consistency_threshold`: minimum score used by the frame validator.
+- `frame_retry_budget`: retries per frame when score is too low.
+- `motion_prior`: motion hint (`auto`, `bounce`, `sway`, `pulse`, `bloom`, `rotate`, `flicker`, `dissolve`).
+
+If `motion_prior` is set to any other value, the backend returns `400` with a validation error.
 
 Response body:
 
@@ -208,6 +255,12 @@ Response body:
 ### Endpoint 2b: List Jobs (Library)
 
 `GET /api/pixel/jobs`
+
+### Palette Catalog
+
+`GET /api/pixel/palettes` returns palette resources that include both color lists and profile metadata
+(for example `dither`, `style`, `outline`, `highlight`, `shadow`, `contrast`, `gamma`).
+Clients should treat palette `id` as the source-of-truth preset key.
 
 Query params:
 
@@ -239,14 +292,17 @@ Response body:
   "job_id": "uuid",
   "status": "success",
   "result": {
-    "image_url": "/api/pixel/files/output.png",
-    "spritesheet_url": "/api/pixel/files/output_sheet.png",
+    "image_url": "/outputs/uuid/output.png",
+    "frame_urls": [
+      "/outputs/uuid/frames/frame_000.png",
+      "/outputs/uuid/frames/frame_001.png"
+    ],
     "download": {
-      "png_url": "/api/pixel/files/output.png",
-      "webp_url": "/api/pixel/files/output.webp",
-      "gif_url": "/api/pixel/files/output.gif",
-      "spritesheet_png_url": "/api/pixel/files/output_sheet.png",
-      "metadata_url": "/api/pixel/files/output.json"
+      "png_url": "/outputs/uuid/output.png",
+      "webp_url": "/outputs/uuid/output.webp",
+      "gif_url": "",
+      "spritesheet_png_url": "/outputs/uuid/output.png",
+      "metadata_url": "/outputs/uuid/metadata.json"
     },
     "metadata": {
       "output_format": "spritesheet_png"
@@ -260,6 +316,18 @@ Response body:
 
 `POST /api/pixel/jobs/{job_id}/cancel`
 
+### Endpoint 4: Asset Presets
+
+`GET /api/pixel/asset-presets`
+
+Returns built-in and JSON-loaded presets (sprite/tile/prop/effect/ui) with prompt tags and post-processing defaults.
+
+### Endpoint 5: Character DNA Catalog
+
+`GET /api/pixel/character-dna`
+
+Returns optional character DNA resources used for prompt consistency binding.
+
 ### Endpoint 4: List Models
 
 `GET /api/pixel/models`
@@ -268,10 +336,11 @@ Return only frontend-legal choices, not every raw backend model.
 
 Frontend-ready examples:
 
-- oai_gpt2_low
-- oai_gpt2_medium
-- oai_gpt2_high
-- pixel_master (local SDXL pipeline)
+- sdxl_base
+- sdxl_pixel_art
+- sdxl_swordsman
+- sdxl_jinja_shrine
+- checkpoint:<filename> (auto-discovered local checkpoints)
 
 ### Endpoint 5: Palette Presets
 
@@ -281,7 +350,7 @@ Frontend-ready examples:
 
 `POST /api/pixel/export/spritesheet`
 
-This allows converting already-generated frames into a sheet without regenerating the art.
+Status: planned for next backend hardening phase. Not implemented in the current backend.
 
 ### Endpoint 7: List Export Formats
 

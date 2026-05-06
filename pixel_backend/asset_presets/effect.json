@@ -1,0 +1,19 @@
+{
+  "id": "effect",
+  "label": "Effect",
+  "prompt_tags": [
+    "effect sprite",
+    "transparent background",
+    "energy burst"
+  ],
+  "post_processing": {
+    "pixel_cleanup": true,
+    "outline_strength": 0,
+    "anti_alias_level": 1,
+    "cluster_smoothing": 0,
+    "contrast_boost": 1,
+    "shadow_reinforcement": 0,
+    "highlight_reinforcement": 1,
+    "palette_strictness": 1
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "prop",
+  "label": "Prop",
+  "prompt_tags": [
+    "isolated prop",
+    "readable shape",
+    "clean edges"
+  ],
+  "post_processing": {
+    "pixel_cleanup": true,
+    "outline_strength": 1,
+    "anti_alias_level": 1,
+    "cluster_smoothing": 1,
+    "contrast_boost": 0,
+    "shadow_reinforcement": 1,
+    "highlight_reinforcement": 0,
+    "palette_strictness": 1
+  }
+}

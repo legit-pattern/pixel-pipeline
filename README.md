@@ -6,6 +6,10 @@ The old bundled WebUI/frontend surface has been removed. This repo now exposes a
 
 ## Canonical Entry Point
 
+Install backend dependencies into the project virtual environment first:
+
+`d:/dev/pixel-pipeline/.venv/Scripts/python.exe -m pip install -r requirements.txt`
+
 Start backend:
 
 `py -3 -m pixel_backend`
@@ -42,9 +46,21 @@ Stop both with `Ctrl+C` in the same terminal.
 - `GET /healthz`
 - `GET /api/pixel/models`
 - `GET /api/pixel/palettes`
+- `GET /api/pixel/export-formats`
 - `POST /api/pixel/jobs/generate`
+- `GET /api/pixel/jobs`
 - `GET /api/pixel/jobs/{job_id}`
 - `POST /api/pixel/jobs/{job_id}/cancel`
+
+## API Contract Tests
+
+Install test dependencies:
+
+`pip install -r requirements-test.txt`
+
+Run contract tests:
+
+`pytest tests/test_pixel_api_contract.py -q`
 
 ## Important State
 

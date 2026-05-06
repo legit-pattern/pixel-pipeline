@@ -2,6 +2,9 @@ fastapi>=0.110.0
 uvicorn>=0.30.0
 
 torch
+diffusers
+transformers>=4.41,<5
+accelerate
 safetensors
 
 Pillow

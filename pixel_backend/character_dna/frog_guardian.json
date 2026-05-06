@@ -1,0 +1,14 @@
+{
+  "id": "frog_guardian",
+  "label": "Frog Guardian",
+  "silhouette": "compact amphibian body, broad shoulders, short legs",
+  "proportions": "short lower body, medium-wide torso, oversized hands",
+  "eyes": "large bright circular eyes",
+  "texture": "mossy stone skin",
+  "biome": "swamp",
+  "prompt_tags": [
+    "consistent frog guardian silhouette",
+    "same character identity across variants",
+    "recognizable face structure"
+  ]
+}

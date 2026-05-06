@@ -1,0 +1,30 @@
+{
+  "id": "commodore64",
+  "name": "Commodore 64",
+  "colors": [
+    "#000000",
+    "#ffffff",
+    "#813338",
+    "#75cec8",
+    "#8e3c97",
+    "#56ac4d",
+    "#2e2c9b",
+    "#edf171",
+    "#8e5029",
+    "#553800",
+    "#c46c71",
+    "#4a4a4a",
+    "#7b7b7b",
+    "#a9ff9f",
+    "#706deb",
+    "#b2b2b2"
+  ],
+  "outline": "#000000",
+  "highlight": "#ffffff",
+  "shadow": "#4a4a4a",
+  "dither": "ordered_2x2",
+  "max_colors": 16,
+  "contrast": "high",
+  "gamma": 1.0,
+  "style": "retro_computer"
+}

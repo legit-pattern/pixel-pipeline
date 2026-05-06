@@ -6,15 +6,17 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import pathlib
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,25 +27,65 @@ _LOGGING_CONFIGURED = False
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _MODELS_DIR = _REPO_ROOT / "models"
 _OUTPUT_DIR = _REPO_ROOT / "pixel_output"
+_PALETTES_DIR = _REPO_ROOT / "pixel_backend" / "palettes"
+_ASSET_PRESETS_DIR = _REPO_ROOT / "pixel_backend" / "asset_presets"
+_CHARACTER_DNA_DIR = _REPO_ROOT / "pixel_backend" / "character_dna"
 _OUTPUT_DIR.mkdir(exist_ok=True)
 
-_CHECKPOINT = _MODELS_DIR / "Stable-diffusion" / "sd_xl_base_1.0.safetensors"
+_CHECKPOINT = _MODELS_DIR / "Stable-diffusion" / "pixelArtDiffusionXL_spriteShaper.safetensors"
 _CHECKPOINT_EXTS = {".safetensors", ".ckpt"}
 
 # model_family -> LoRA file (relative to models/Lora/)
+# LoRA compatibility:
+#   ONLY use pixel-art LoRAs (sdxl_pixel_art, sdxl_pixel_art_xl, sdxl_pixel_art_redmond)
+#   with sdxl_base.  Pixel-art checkpoints (pixel_art_diffusion_xl) already have the
+#   style trained in – adding a pixel-art LoRA will fight the checkpoint and degrade output.
+#   General SDXL LoRAs (swordsman, jinja_shrine) are safe with any checkpoint.
 _LORA_MAP: dict[str, str] = {
+    # ── pixel-art LoRAs (use with sdxl_base only) ──────────────────────────
     "sdxl_pixel_art": "64x64_Pixel_Art_SDXL.safetensors",
+    "sdxl_pixel_art_xl": "pixel-art-xl-v1.1.safetensors",
+    # ── general SDXL LoRAs (safe with any checkpoint) ──────────────────────
     "sdxl_swordsman": "SwordsmanXL.safetensors",
     "sdxl_jinja_shrine": "Jinja_Shrine_Zen_SDXL.safetensors",
 }
 
 # model_family -> checkpoint filename in models/Stable-diffusion
+# pixel_art_diffusion_xl: fine-tuned SDXL checkpoint by Yamer – pixel art style baked in,
+#   VAE already baked in, trigger words: PIXEL ART / 64 BIT / 32 BIT / 16 BIT
+#   CFG 4-12 recommended (default 7.5 is fine).  Do NOT pair with pixel-art LoRAs.
 _BASE_MODEL_CHECKPOINTS: dict[str, str] = {
-    "sdxl_base": "sd_xl_base_1.0.safetensors",
+    "sdxl_base": "pixelArtDiffusionXL_spriteShaper.safetensors",
+    "pixel_art_diffusion_xl": "pixelArtDiffusionXL_spriteShaper.safetensors",
+    "sdxl_base_legacy": "sd_xl_base_1.0.safetensors",
 }
+
+_ALLOWED_OUTPUT_FORMATS = {"png", "webp", "gif", "spritesheet_png"}
+_ALLOWED_LANES = {
+    "sprite",
+    "world",
+    "prop",
+    "ui",
+    "portrait",
+    "detail",
+    "atmosphere",
+    "concept",
+}
+_ALLOWED_OUTPUT_MODES = {
+    "sprite",
+    "spritesheet",
+    "sprite_sheet",
+    "prop_sheet",
+    "tile_chunk",
+    "ui_module",
+}
+_HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # ── lazy pipeline cache ────────────────────────────────────────────────────────
 _PIPELINE_CACHE: dict[str, Any] = {}
+_PALETTE_CACHE: dict[str, dict[str, Any]] | None = None
+_ASSET_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
+_CHARACTER_DNA_CACHE: dict[str, dict[str, Any]] | None = None
 
 
 def _configure_logging() -> None:
@@ -67,11 +109,54 @@ class PaletteInput(BaseModel):
 
 
 class SheetInput(BaseModel):
-    frame_width: int = 32
-    frame_height: int = 32
+    frame_width: int = 64
+    frame_height: int = 64
     columns: int = 1
     rows: int = 1
     padding: int = 0
+
+
+class TileOptionsInput(BaseModel):
+    tile_size: int = 64
+    seamless_mode: bool = False
+    autotile_mask: str = "none"
+    variation_count: int = Field(default=1, ge=1, le=16)
+    noise_level: int = Field(default=0, ge=0, le=3)
+    edge_softening: int = Field(default=0, ge=0, le=3)
+
+
+class PostProcessingInput(BaseModel):
+    """Optional post-processing steps applied to the generated image before saving.
+    All flags default to False – the image is returned as-is unless explicitly requested.
+    """
+    pixelate: bool = False
+    """Multi-step pixelation: edge-preserve sharpen → NEAREST downscale → optional palette snap."""
+    remove_background: bool = False
+    """Remove background (requires the `rembg` package; silently skipped if not installed)."""
+    quantize_palette: bool = False
+    """Re-map every pixel to the nearest colour in palette.colors (Floyd-Steinberg dither).
+    Has no effect unless palette.colors is also provided."""
+    pixel_cleanup: bool = False
+    """Run cleanup heuristics: anti-alias snap, isolated-pixel removal, and outline strengthen."""
+    outline_strength: int = Field(default=1, ge=0, le=3)
+    """Sprite contour reinforcement strength. 0=off, 3=strong."""
+    anti_alias_level: int = Field(default=1, ge=0, le=3)
+    """Anti-alias cleanup aggressiveness. 0=off, 3=aggressive snap."""
+    cluster_smoothing: int = Field(default=1, ge=0, le=3)
+    """Isolated-pixel cleanup aggressiveness. 0=off, 3=aggressive."""
+    contrast_boost: int = Field(default=0, ge=0, le=2)
+    """Global contrast pass after cleanup. 0=off, 2=strong."""
+    shadow_reinforcement: int = Field(default=0, ge=0, le=2)
+    """Dark-edge reinforcement amount for silhouette readability."""
+    highlight_reinforcement: int = Field(default=0, ge=0, le=2)
+    """Inner-edge highlight amount for readability."""
+    palette_strictness: int = Field(default=1, ge=0, le=2)
+    """Palette enforcement. 0=loose, 2=hard lock with no dithering."""
+    pixelate_strength: float = Field(default=1.0, ge=0.1, le=4.0)
+    """
+    Pixelation strength multiplier.  1.0 = frame_width×frame_height target.
+    Lower values (e.g. 0.5) give larger pixel-cells; higher values keep more detail.
+    """
 
 
 class GenerateRequest(BaseModel):
@@ -82,8 +167,32 @@ class GenerateRequest(BaseModel):
     output_format: str = "png"
     palette: PaletteInput = Field(default_factory=PaletteInput)
     sheet: SheetInput = Field(default_factory=SheetInput)
+    tile_options: TileOptionsInput = Field(default_factory=TileOptionsInput)
+    post_processing: PostProcessingInput = Field(default_factory=PostProcessingInput)
     source_image_base64: str | None = None
-    model_family: str = "sdxl_base"
+    model_family: str = "pixel_art_diffusion_xl"
+    seed: int = -1
+    """RNG seed for reproducible generation. -1 = random each run."""
+    cfg_scale: float = Field(default=7.5, ge=1.0, le=30.0)
+    """Classifier-free guidance scale.  Higher = follows prompt more strictly."""
+    enhance_prompt: bool = True
+    """Automatically inject lane-appropriate pixel-art keywords into the prompt."""
+    auto_pipeline: bool = True
+    """Run the recommended pixel pipeline automatically (8x gen -> pixelate -> quantize if palette exists)."""
+    asset_preset: str = "auto"
+    """Asset-type preset id (sprite/tile/prop/effect/ui) or 'auto' to infer from lane."""
+    character_dna_id: str | None = None
+    """Optional character DNA profile id for style consistency and prompt augmentation."""
+    keyframe_first: bool = False
+    """Generate one keyframe first, then derive remaining frames from it."""
+    variation_strength: float = Field(default=0.35, ge=0.0, le=1.0)
+    """How much later frames may deviate from the keyframe."""
+    consistency_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    """Minimum consistency score a derived frame should meet."""
+    frame_retry_budget: int = Field(default=2, ge=0, le=6)
+    """Retries per frame when consistency score is below threshold."""
+    motion_prior: str = "auto"
+    """Motion prior for frame derivation: auto|bloom|pulse|sway|rotate|bounce|flicker|dissolve."""
 
 
 class JobResponse(BaseModel):
@@ -139,6 +248,73 @@ def _is_base64_png(value: str) -> bool:
     return raw.startswith(b"\x89PNG")
 
 
+def _validate_generate_request(request: GenerateRequest) -> None:
+    if not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    if request.output_format not in _ALLOWED_OUTPUT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail="output_format must be one of: png, webp, gif, spritesheet_png",
+        )
+
+    if request.lane not in _ALLOWED_LANES:
+        allowed = ", ".join(sorted(_ALLOWED_LANES))
+        raise HTTPException(status_code=400, detail=f"lane must be one of: {allowed}")
+
+    if request.output_mode not in _ALLOWED_OUTPUT_MODES:
+        allowed = ", ".join(sorted(_ALLOWED_OUTPUT_MODES))
+        raise HTTPException(status_code=400, detail=f"output_mode must be one of: {allowed}")
+
+    if not (2 <= request.palette.size <= 256):
+        raise HTTPException(status_code=400, detail="palette.size must be between 2 and 256")
+
+    if request.palette.colors:
+        if len(request.palette.colors) > request.palette.size:
+            raise HTTPException(
+                status_code=400,
+                detail="palette.colors length cannot exceed palette.size",
+            )
+
+        invalid = [color for color in request.palette.colors if not _HEX_COLOR_PATTERN.match(color)]
+        if invalid:
+            raise HTTPException(status_code=400, detail="palette.colors must contain #RRGGBB hex values")
+    else:
+        preset_id = request.palette.preset.strip().lower()
+        if preset_id != "custom":
+            catalog = _get_palette_catalog()
+            if preset_id not in catalog:
+                raise HTTPException(status_code=400, detail=f"unknown palette preset: {request.palette.preset}")
+
+    sheet = request.sheet
+    if sheet.frame_width < 8 or sheet.frame_height < 8:
+        raise HTTPException(status_code=400, detail="sheet frame dimensions must be at least 8")
+    if sheet.columns < 1 or sheet.rows < 1:
+        raise HTTPException(status_code=400, detail="sheet columns and rows must be at least 1")
+    if sheet.padding < 0:
+        raise HTTPException(status_code=400, detail="sheet padding cannot be negative")
+
+    tile = request.tile_options
+    if tile.tile_size < 8 or tile.tile_size > 128:
+        raise HTTPException(status_code=400, detail="tile_options.tile_size must be between 8 and 128")
+
+    allowed_motion_priors = {"auto", "bloom", "pulse", "sway", "rotate", "bounce", "flicker", "dissolve"}
+    requested_motion_prior = request.motion_prior.strip().lower()
+    if requested_motion_prior not in allowed_motion_priors:
+        allowed = ", ".join(sorted(allowed_motion_priors))
+        raise HTTPException(status_code=400, detail=f"motion_prior must be one of: {allowed}")
+
+    if request.asset_preset.strip().lower() != "auto":
+        preset_catalog = _get_asset_preset_catalog()
+        if request.asset_preset.strip().lower() not in preset_catalog:
+            raise HTTPException(status_code=400, detail=f"unknown asset_preset: {request.asset_preset}")
+
+    if request.character_dna_id:
+        dna_catalog = _get_character_dna_catalog()
+        if request.character_dna_id.strip().lower() not in dna_catalog:
+            raise HTTPException(status_code=400, detail=f"unknown character_dna_id: {request.character_dna_id}")
+
+
 def _list_local_checkpoints() -> list[pathlib.Path]:
     stable_diffusion_dir = _MODELS_DIR / "Stable-diffusion"
     if not stable_diffusion_dir.exists():
@@ -152,15 +328,323 @@ def _list_local_checkpoints() -> list[pathlib.Path]:
     return sorted(candidates, key=lambda p: p.name.lower())
 
 
+def _default_palette_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        "custom": {
+            "id": "custom",
+            "label": "Custom",
+            "size": 16,
+            "colors": [],
+            "outline": None,
+            "highlight": None,
+            "shadow": None,
+            "dither": "floyd_steinberg",
+            "max_colors": 16,
+            "contrast": "medium",
+            "gamma": 1.0,
+            "style": "custom",
+        },
+        "gameboy": {
+            "id": "gameboy",
+            "label": "Game Boy",
+            "size": 4,
+            "colors": ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"],
+            "outline": "#0f380f",
+            "highlight": "#9bbc0f",
+            "shadow": "#306230",
+            "dither": "ordered_2x2",
+            "max_colors": 4,
+            "contrast": "high",
+            "gamma": 1.0,
+            "style": "handheld",
+        },
+    }
+
+
+def _normalize_palette_profile(palette_id: str, raw: dict[str, Any]) -> dict[str, Any] | None:
+    colors_raw = raw.get("colors")
+    if not isinstance(colors_raw, list):
+        return None
+
+    colors: list[str] = []
+    for color in colors_raw:
+        if isinstance(color, str) and _HEX_COLOR_PATTERN.match(color):
+            colors.append(color.lower())
+
+    if not colors:
+        return None
+
+    label = str(raw.get("name") or raw.get("label") or palette_id).strip() or palette_id
+    max_colors = int(raw.get("max_colors") or len(colors))
+    max_colors = max(2, min(256, max_colors))
+    outline = raw.get("outline") if isinstance(raw.get("outline"), str) else None
+    highlight = raw.get("highlight") if isinstance(raw.get("highlight"), str) else None
+    shadow = raw.get("shadow") if isinstance(raw.get("shadow"), str) else None
+    gamma = float(raw.get("gamma", 1.0))
+
+    return {
+        "id": palette_id,
+        "label": label,
+        "size": min(max_colors, len(colors)),
+        "colors": colors,
+        "outline": outline,
+        "highlight": highlight,
+        "shadow": shadow,
+        "dither": str(raw.get("dither") or "floyd_steinberg"),
+        "max_colors": max_colors,
+        "contrast": str(raw.get("contrast") or "medium"),
+        "gamma": gamma,
+        "style": str(raw.get("style") or "generic"),
+    }
+
+
+def _get_palette_catalog() -> dict[str, dict[str, Any]]:
+    global _PALETTE_CACHE
+    if _PALETTE_CACHE is not None:
+        return _PALETTE_CACHE
+
+    catalog = _default_palette_catalog()
+    if _PALETTES_DIR.exists():
+        for json_file in sorted(_PALETTES_DIR.glob("*.json"), key=lambda p: p.name.lower()):
+            try:
+                payload = json.loads(json_file.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                palette_id = str(payload.get("id") or json_file.stem).strip().lower()
+                if not palette_id:
+                    continue
+                normalized = _normalize_palette_profile(palette_id, payload)
+                if normalized is None:
+                    log.warning("Skipping invalid palette profile: %s", json_file.name)
+                    continue
+                catalog[palette_id] = normalized
+            except Exception as exc:
+                log.warning("Failed to load palette profile %s: %s", json_file.name, exc)
+
+    _PALETTE_CACHE = catalog
+    return catalog
+
+
+def _resolve_palette_context(palette: PaletteInput) -> dict[str, Any]:
+    catalog = _get_palette_catalog()
+    preset_id = palette.preset.strip().lower() or "custom"
+    profile = catalog.get(preset_id, catalog["custom"])
+
+    # Treat preset palettes as stylistic guidance only.
+    # Hard palette locking should happen only when the client provides explicit colors.
+    colors = [c.lower() for c in palette.colors if _HEX_COLOR_PATTERN.match(c)]
+
+    return {
+        "id": profile.get("id", preset_id),
+        "label": profile.get("label", palette.preset),
+        "colors": colors,
+        "profile": profile,
+    }
+
+
+def _default_asset_preset_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        "sprite": {
+            "id": "sprite",
+            "label": "Sprite",
+            "prompt_tags": ["clean silhouette", "readable sprite", "clear outline"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 2,
+                "anti_alias_level": 2,
+                "cluster_smoothing": 1,
+                "contrast_boost": 1,
+            },
+        },
+        "tile": {
+            "id": "tile",
+            "label": "Tile",
+            "prompt_tags": ["tileable", "seamless edges", "top-down tile"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 0,
+                "anti_alias_level": 1,
+                "cluster_smoothing": 2,
+                "contrast_boost": 0,
+            },
+        },
+        "prop": {
+            "id": "prop",
+            "label": "Prop",
+            "prompt_tags": ["isolated prop", "clear volume", "readable shape"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 1,
+                "anti_alias_level": 1,
+                "cluster_smoothing": 1,
+            },
+        },
+        "effect": {
+            "id": "effect",
+            "label": "Effect",
+            "prompt_tags": ["effect sprite", "emissive style", "transparent background"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 0,
+                "anti_alias_level": 1,
+                "cluster_smoothing": 0,
+            },
+        },
+        "ui": {
+            "id": "ui",
+            "label": "UI",
+            "prompt_tags": ["icon", "flat interface", "no text"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 1,
+                "anti_alias_level": 2,
+                "cluster_smoothing": 1,
+            },
+        },
+    }
+
+
+def _get_asset_preset_catalog() -> dict[str, dict[str, Any]]:
+    global _ASSET_PRESET_CACHE
+    if _ASSET_PRESET_CACHE is not None:
+        return _ASSET_PRESET_CACHE
+
+    catalog = _default_asset_preset_catalog()
+    if _ASSET_PRESETS_DIR.exists():
+        for json_file in sorted(_ASSET_PRESETS_DIR.glob("*.json"), key=lambda p: p.name.lower()):
+            try:
+                payload = json.loads(json_file.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                preset_id = str(payload.get("id") or json_file.stem).strip().lower()
+                if not preset_id:
+                    continue
+                label = str(payload.get("label") or payload.get("name") or preset_id)
+                prompt_tags = payload.get("prompt_tags")
+                if not isinstance(prompt_tags, list):
+                    prompt_tags = []
+                pp = payload.get("post_processing")
+                if not isinstance(pp, dict):
+                    pp = {}
+                catalog[preset_id] = {
+                    "id": preset_id,
+                    "label": label,
+                    "prompt_tags": [str(item) for item in prompt_tags if str(item).strip()],
+                    "post_processing": pp,
+                }
+            except Exception as exc:
+                log.warning("Failed to load asset preset %s: %s", json_file.name, exc)
+
+    _ASSET_PRESET_CACHE = catalog
+    return catalog
+
+
+def _default_character_dna_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        "frog_guardian": {
+            "id": "frog_guardian",
+            "label": "Frog Guardian",
+            "silhouette": "compact frog humanoid with broad shoulders",
+            "proportions": "short legs, wide torso",
+            "eyes": "bright round eyes",
+            "texture": "stone + moss",
+            "biome": "swamp",
+            "prompt_tags": [
+                "consistent frog guardian silhouette",
+                "same character identity",
+                "recognizable facial structure",
+            ],
+        }
+    }
+
+
+def _get_character_dna_catalog() -> dict[str, dict[str, Any]]:
+    global _CHARACTER_DNA_CACHE
+    if _CHARACTER_DNA_CACHE is not None:
+        return _CHARACTER_DNA_CACHE
+
+    catalog = _default_character_dna_catalog()
+    if _CHARACTER_DNA_DIR.exists():
+        for json_file in sorted(_CHARACTER_DNA_DIR.glob("*.json"), key=lambda p: p.name.lower()):
+            try:
+                payload = json.loads(json_file.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    continue
+                dna_id = str(payload.get("id") or json_file.stem).strip().lower()
+                if not dna_id:
+                    continue
+                payload["id"] = dna_id
+                payload["label"] = str(payload.get("label") or payload.get("name") or dna_id)
+                tags = payload.get("prompt_tags")
+                if not isinstance(tags, list):
+                    payload["prompt_tags"] = []
+                else:
+                    payload["prompt_tags"] = [str(item) for item in tags if str(item).strip()]
+                catalog[dna_id] = payload
+            except Exception as exc:
+                log.warning("Failed to load character DNA %s: %s", json_file.name, exc)
+
+    _CHARACTER_DNA_CACHE = catalog
+    return catalog
+
+
+def _resolve_asset_preset_context(req: GenerateRequest) -> dict[str, Any]:
+    catalog = _get_asset_preset_catalog()
+    requested = req.asset_preset.strip().lower()
+    if requested == "auto" or requested == "":
+        lane_to_preset = {
+            "sprite": "sprite",
+            "world": "tile",
+            "prop": "prop",
+            "ui": "ui",
+            "detail": "tile",
+            "atmosphere": "effect",
+            "concept": "sprite",
+            "portrait": "sprite",
+        }
+        preset_id = lane_to_preset.get(req.lane, "sprite")
+    else:
+        preset_id = requested
+    return catalog.get(preset_id, catalog["sprite"])
+
+
+def _resolve_character_dna_context(character_dna_id: str | None) -> dict[str, Any] | None:
+    if not character_dna_id:
+        return None
+    return _get_character_dna_catalog().get(character_dna_id.strip().lower())
+
+
+def _resolve_effective_post_processing(req: GenerateRequest, preset_ctx: dict[str, Any]) -> dict[str, Any]:
+    default_pp = PostProcessingInput().model_dump()
+    user_pp = req.post_processing.model_dump()
+    preset_pp = preset_ctx.get("post_processing") if isinstance(preset_ctx.get("post_processing"), dict) else {}
+
+    # Override hierarchy:
+    # 1) framework defaults
+    # 2) preset defaults
+    # 3) explicit user overrides (values that differ from framework defaults)
+    effective = dict(default_pp)
+    effective.update(preset_pp)
+    for key, value in user_pp.items():
+        if key in default_pp and value != default_pp[key]:
+            effective[key] = value
+
+    return effective
+
+
 def _resolve_model_spec(model_family: str) -> tuple[pathlib.Path, str | None]:
     if model_family in _BASE_MODEL_CHECKPOINTS:
         checkpoint_path = _MODELS_DIR / "Stable-diffusion" / _BASE_MODEL_CHECKPOINTS[model_family]
+        lora_file = None
+    elif model_family in _LORA_MAP:
+        checkpoint_path = _CHECKPOINT
+        lora_file = _LORA_MAP[model_family]
     elif model_family.startswith("checkpoint:"):
         checkpoint_name = model_family.split(":", 1)[1].strip()
         checkpoint_path = _MODELS_DIR / "Stable-diffusion" / checkpoint_name
+        lora_file = None
     else:
-        # LoRA families default to the baseline SDXL checkpoint.
-        checkpoint_path = _CHECKPOINT
+        raise ValueError(f"Unknown model_family={model_family}")
 
     if not checkpoint_path.exists():
         raise ValueError(f"Checkpoint not found for model_family={model_family}: {checkpoint_path.name}")
@@ -168,7 +652,6 @@ def _resolve_model_spec(model_family: str) -> tuple[pathlib.Path, str | None]:
     if checkpoint_path.suffix.lower() not in _CHECKPOINT_EXTS:
         raise ValueError(f"Unsupported checkpoint extension for {checkpoint_path.name}")
 
-    lora_file = _LORA_MAP.get(model_family)
     return checkpoint_path, lora_file
 
 
@@ -215,7 +698,11 @@ def _load_pipeline(model_family: str) -> Any:
     )
     pipe = pipe.to(device)
     pipe.enable_attention_slicing()
-    pipe.enable_vae_slicing()
+    # Diffusers >=0.39 deprecates pipe.enable_vae_slicing() for SDXL.
+    if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+        pipe.vae.enable_slicing()
+    else:
+        pipe.enable_vae_slicing()
     pipe.set_progress_bar_config(disable=False)
     log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
 
@@ -235,6 +722,727 @@ def _load_pipeline(model_family: str) -> Any:
 
     _PIPELINE_CACHE[cache_key] = pipe
     return pipe
+
+
+def _pixelate(img: Any, pixel_w: int, pixel_h: int, strength: float = 1.0) -> Any:
+    """Professional-grade multi-step pixelation.
+
+    Steps:
+    1. LANCZOS downscale to intermediate size (reduces high-frequency noise).
+    2. Unsharp-mask to accentuate edges before final pixel snap.
+    3. NEAREST downscale to target pixel size (the actual pixel-art step).
+    4. NEAREST upscale back to original resolution for clean crisp blocks.
+
+    `strength` scales the target size.  1.0 = exact frame size.  0.5 = double-size pixels.
+    """
+    from PIL import Image, ImageFilter
+
+    orig_w, orig_h = img.size
+    rgb = img.convert("RGB")
+
+    # target pixel-art cell counts
+    target_w = max(4, int(pixel_w * strength))
+    target_h = max(4, int(pixel_h * strength))
+    target_w = min(target_w, orig_w)
+    target_h = min(target_h, orig_h)
+
+    # Step 1: smooth with LANCZOS to an intermediate size (~2× target) to remove generation noise
+    inter_w = max(target_w, min(orig_w, target_w * 2))
+    inter_h = max(target_h, min(orig_h, target_h * 2))
+    smooth = rgb.resize((inter_w, inter_h), Image.Resampling.LANCZOS)
+
+    # Step 2: accentuate edges with unsharp-mask so pixel boundaries stay clean
+    sharpened = smooth.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=2))
+
+    # Step 3: NEAREST downscale to final pixel-art resolution (the key step)
+    small = sharpened.resize((target_w, target_h), Image.Resampling.NEAREST)
+
+    # Step 4: upscale back to original display size with NEAREST (preserves crisp blocks)
+    result = small.resize((orig_w, orig_h), Image.Resampling.NEAREST)
+
+    # Restore alpha channel if the input had one
+    if img.mode == "RGBA":
+        alpha = img.getchannel("A").resize((orig_w, orig_h), Image.Resampling.NEAREST)
+        result = result.convert("RGBA")
+        result.putalpha(alpha)
+
+    return result
+
+
+def _quantize_to_palette(img: Any, hex_colors: list[str], dither_mode: str = "floyd_steinberg") -> Any:
+    """Re-map every pixel to the nearest colour in hex_colors.
+
+    Returns an RGBA image so transparency from a previous remove-background step is preserved.
+    """
+    from PIL import Image
+
+    # Build a flat 768-byte palette (256 RGB entries) for PIL
+    flat: list[int] = []
+    for h in hex_colors:
+        flat += [int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)]
+    flat += [0] * (768 - len(flat))
+
+    palette_img = Image.new("P", (1, 1))
+    palette_img.putpalette(flat)
+
+    dither = Image.Dither.FLOYDSTEINBERG
+    if dither_mode in {"none", "off"}:
+        dither = Image.Dither.NONE
+
+    quantized = img.convert("RGB").quantize(
+        palette=palette_img,
+        dither=dither,
+    )
+    return quantized.convert("RGBA")
+
+
+def _remove_background(img: Any) -> Any:
+    """Remove background via rembg.  Silently no-ops if rembg is not installed."""
+    try:
+        from rembg import remove as rembg_remove  # type: ignore[import-untyped]
+
+        return rembg_remove(img)
+    except ImportError:
+        log.warning("rembg is not installed; background removal step skipped")
+        return img
+
+
+def _remove_antialiasing(img: Any, hex_colors: list[str], level: int = 1, strictness: int = 1) -> Any:
+    """Snap likely anti-aliased pixels to the nearest palette colour.
+
+    A pixel is considered anti-aliasing noise when it is near-gray
+    (small per-channel spread) or semi-transparent. Those pixels are then
+    mapped to the closest palette entry in RGB space.
+    """
+    from PIL import Image
+
+    if not hex_colors:
+        return img
+
+    try:
+        import numpy as np
+    except ImportError:
+        log.warning("numpy is not installed; anti-alias cleanup step skipped")
+        return img
+
+    rgba = img.convert("RGBA")
+    arr = np.array(rgba, dtype=np.uint8)
+    rgb = arr[..., :3].astype(np.int16)
+    alpha = arr[..., 3]
+
+    # Build palette matrix [N, 3]
+    palette = np.array(
+        [[int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)] for c in hex_colors],
+        dtype=np.int16,
+    )
+
+    channel_max = rgb.max(axis=2)
+    channel_min = rgb.min(axis=2)
+    # Higher level means broader anti-aliased detection band.
+    gray_band = 12 + level * 10
+    near_gray = (channel_max - channel_min) <= gray_band
+    semi_transparent = (alpha > 0) & (alpha < 255)
+    mask = (near_gray | semi_transparent) & (alpha > 0)
+
+    # Strict palettes also snap colours that are close-but-not-exact palette variants.
+    if strictness > 0:
+        px_all = rgb.reshape((-1, 3))
+        d2_all = ((px_all[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2)
+        nearest_d2 = d2_all.min(axis=1).reshape(rgb.shape[:2])
+        dist_threshold = (6 + strictness * 6) ** 2
+        near_palette = (nearest_d2 <= dist_threshold) & (alpha > 0)
+        mask = mask | near_palette
+
+    if not mask.any():
+        return rgba
+
+    coords = np.argwhere(mask)
+    px = rgb[mask]  # [K,3]
+    # Broadcast distance: [K,1,3] - [1,N,3] => [K,N,3]
+    d2 = ((px[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2)
+    nearest = palette[d2.argmin(axis=1)].astype(np.uint8)
+
+    arr[coords[:, 0], coords[:, 1], :3] = nearest
+    return Image.fromarray(arr, mode="RGBA")
+
+
+def _remove_isolated_pixels(img: Any, max_neighbors_same: int = 1) -> Any:
+    """Replace isolated opaque pixels using 4-neighbour majority colour."""
+    from PIL import Image
+
+    try:
+        import numpy as np
+    except ImportError:
+        log.warning("numpy is not installed; isolated-pixel cleanup step skipped")
+        return img
+
+    rgba = img.convert("RGBA")
+    arr = np.array(rgba, dtype=np.uint8)
+    h, w, _ = arr.shape
+
+    out = arr.copy()
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if arr[y, x, 3] == 0:
+                continue
+
+            center = arr[y, x, :3]
+            neighbors = [
+                arr[y - 1, x],
+                arr[y + 1, x],
+                arr[y, x - 1],
+                arr[y, x + 1],
+            ]
+            opaque_neighbors = [n for n in neighbors if n[3] > 0]
+            if not opaque_neighbors:
+                continue
+
+            same_count = sum(1 for n in opaque_neighbors if (n[:3] == center).all())
+            if same_count > max_neighbors_same:
+                continue
+
+            # Majority vote by exact RGB tuple among opaque neighbours.
+            counts: dict[tuple[int, int, int], int] = {}
+            for n in opaque_neighbors:
+                key = (int(n[0]), int(n[1]), int(n[2]))
+                counts[key] = counts.get(key, 0) + 1
+            winner = max(counts.items(), key=lambda item: item[1])[0]
+            out[y, x, 0] = winner[0]
+            out[y, x, 1] = winner[1]
+            out[y, x, 2] = winner[2]
+
+    return Image.fromarray(out, mode="RGBA")
+
+
+def _strengthen_outline(
+    img: Any,
+    outline_strength: int = 1,
+    shadow_reinforcement: int = 0,
+    highlight_reinforcement: int = 0,
+) -> Any:
+    """Thicken and stylize alpha contour for sprite readability."""
+    from PIL import Image, ImageChops, ImageFilter
+
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    kernel = 3 + max(0, outline_strength) * 2
+    dilated = alpha.filter(ImageFilter.MaxFilter(kernel))
+    edge = ImageChops.subtract(dilated, alpha)
+
+    # Compose a dark outline only where edge mask is present.
+    dark_level = 8 + shadow_reinforcement * 10
+    outline = Image.new("RGBA", rgba.size, (dark_level, dark_level, dark_level + 2, 255))
+    strengthened = Image.composite(outline, rgba, edge)
+
+    if highlight_reinforcement > 0:
+        inner_edge = ImageChops.subtract(alpha, alpha.filter(ImageFilter.MinFilter(3)))
+        bright = 205 + highlight_reinforcement * 20
+        highlight = Image.new("RGBA", rgba.size, (bright, bright, bright, 255))
+        strengthened = Image.composite(highlight, strengthened, inner_edge)
+
+    strengthened.putalpha(dilated)
+    return strengthened
+
+
+def _enforce_tile_seamlessness(img: Any, edge_softening: int = 0, noise_level: int = 0) -> Any:
+    """Force opposite edges to match so the tile loops more cleanly.
+
+    This is a lightweight deterministic post-pass, not a full texture synthesis system.
+    """
+    from PIL import Image
+
+    try:
+        import numpy as np
+    except ImportError:
+        log.warning("numpy is not installed; tile seamless pass skipped")
+        return img
+
+    rgba = img.convert("RGBA")
+    arr = np.array(rgba, dtype=np.uint8)
+    h, w, _ = arr.shape
+    if h < 2 or w < 2:
+        return rgba
+
+    # Match opposite borders by averaging them.
+    top_bottom = ((arr[0, :, :].astype(np.uint16) + arr[h - 1, :, :].astype(np.uint16)) // 2).astype(np.uint8)
+    left_right = ((arr[:, 0, :].astype(np.uint16) + arr[:, w - 1, :].astype(np.uint16)) // 2).astype(np.uint8)
+    arr[0, :, :] = top_bottom
+    arr[h - 1, :, :] = top_bottom
+    arr[:, 0, :] = left_right
+    arr[:, w - 1, :] = left_right
+
+    band = max(0, min(3, edge_softening))
+    for i in range(1, band + 1):
+        alpha = (band + 1 - i) / (band + 1)
+        arr[i, :, :] = (arr[i, :, :] * (1 - alpha) + arr[0, :, :] * alpha).astype(np.uint8)
+        arr[h - 1 - i, :, :] = (arr[h - 1 - i, :, :] * (1 - alpha) + arr[h - 1, :, :] * alpha).astype(np.uint8)
+        arr[:, i, :] = (arr[:, i, :] * (1 - alpha) + arr[:, 0, :] * alpha).astype(np.uint8)
+        arr[:, w - 1 - i, :] = (arr[:, w - 1 - i, :] * (1 - alpha) + arr[:, w - 1, :] * alpha).astype(np.uint8)
+
+    # Noise level adds a mild median smoothing to reduce jitter on repeated tiles.
+    result = Image.fromarray(arr, mode="RGBA")
+    if noise_level > 0:
+        from PIL import ImageFilter
+
+        result = result.filter(ImageFilter.MedianFilter(size=3))
+
+    return result
+
+
+def _apply_autotile_mask(img: Any, autotile_mask: str) -> Any:
+    """Apply simple alpha masks commonly useful for prototype autotiles."""
+    from PIL import Image, ImageDraw
+
+    mask_name = autotile_mask.strip().lower()
+    if mask_name == "none":
+        return img
+
+    rgba = img.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    draw = ImageDraw.Draw(alpha)
+    w, h = rgba.size
+
+    if mask_name == "wall_top":
+        draw.rectangle((0, 0, w, max(1, h // 6)), fill=255)
+    elif mask_name == "platform":
+        draw.rectangle((0, max(0, h - h // 4), w, h), fill=255)
+    elif mask_name == "blob_4way":
+        r = max(1, min(w, h) // 6)
+        draw.rectangle((0, 0, w, h), fill=255)
+        draw.pieslice((0, 0, r * 2, r * 2), 180, 270, fill=0)
+        draw.pieslice((w - r * 2, 0, w, r * 2), 270, 360, fill=0)
+        draw.pieslice((0, h - r * 2, r * 2, h), 90, 180, fill=0)
+        draw.pieslice((w - r * 2, h - r * 2, w, h), 0, 90, fill=0)
+
+    rgba.putalpha(alpha)
+    return rgba
+
+
+def _apply_post_processing(
+    img: Any,
+    req: "GenerateRequest",
+    effective_pp: dict[str, Any],
+    palette_colors: list[str],
+    palette_profile: dict[str, Any],
+) -> Any:
+    """Apply optional post-processing steps in the correct order.
+
+    Auto mode guarantees the core pixel pipeline even when manual checkboxes are off:
+    pixelate is forced on, and quantize is forced on when palette colours are supplied.
+    """
+    # Resolve effective chain based on resolved settings and auto/manual mode.
+    use_pixelate = bool(effective_pp.get("pixelate", False) or req.auto_pipeline)
+    use_quantize = bool(effective_pp.get("quantize_palette", False) or (req.auto_pipeline and bool(palette_colors)))
+    use_cleanup = bool(effective_pp.get("pixel_cleanup", False) or req.auto_pipeline)
+    anti_alias_level = int(effective_pp.get("anti_alias_level", 1))
+    cluster_smoothing = int(effective_pp.get("cluster_smoothing", 1))
+    outline_strength = int(effective_pp.get("outline_strength", 1))
+    contrast_boost = int(effective_pp.get("contrast_boost", 0))
+    shadow_reinforcement = int(effective_pp.get("shadow_reinforcement", 0))
+    highlight_reinforcement = int(effective_pp.get("highlight_reinforcement", 0))
+    palette_strictness = int(effective_pp.get("palette_strictness", 1))
+    pixelate_strength = float(effective_pp.get("pixelate_strength", 1.0))
+    remove_background = bool(effective_pp.get("remove_background", False))
+    tile = req.tile_options
+
+    if req.auto_pipeline:
+        # Auto mode applies production-safe defaults.
+        anti_alias_level = max(anti_alias_level, 1)
+        cluster_smoothing = max(cluster_smoothing, 1)
+        outline_strength = max(outline_strength, 1 if req.lane == "sprite" else 0)
+        palette_strictness = max(palette_strictness, 1)
+
+    dither_mode = str(palette_profile.get("dither") or "floyd_steinberg")
+    if palette_strictness >= 2:
+        dither_mode = "none"
+
+    # 1. Remove background first so pixelation/quantisation work on clean content
+    if remove_background:
+        img = _remove_background(img)
+
+    # 2. Pixelate – professional multi-step pipeline
+    if use_pixelate:
+        img = _pixelate(
+            img,
+            req.sheet.frame_width,
+            req.sheet.frame_height,
+            strength=pixelate_strength,
+        )
+
+    # 3. Palette quantisation – only meaningful if colours are provided
+    if use_quantize and palette_colors:
+        img = _quantize_to_palette(img, palette_colors, dither_mode=dither_mode)
+
+    # 4. Pixel cleanup – last pass for readability and artefact cleanup.
+    if use_cleanup:
+        if anti_alias_level > 0 and palette_colors:
+            img = _remove_antialiasing(
+                img,
+                palette_colors,
+                level=anti_alias_level,
+                strictness=palette_strictness,
+            )
+        if cluster_smoothing > 0:
+            max_neighbors_same = max(0, 2 - cluster_smoothing)
+            img = _remove_isolated_pixels(img, max_neighbors_same=max_neighbors_same)
+        if req.lane == "sprite" and outline_strength > 0:
+            img = _strengthen_outline(
+                img,
+                outline_strength=outline_strength,
+                shadow_reinforcement=shadow_reinforcement,
+                highlight_reinforcement=highlight_reinforcement,
+            )
+        if contrast_boost > 0:
+            from PIL import ImageEnhance
+
+            factor = 1.0 + 0.12 * contrast_boost
+            img = ImageEnhance.Contrast(img.convert("RGBA")).enhance(factor)
+
+        # Hard-lock mode: run a final no-dither quantize after cleanup.
+        if palette_colors and palette_strictness >= 2:
+            img = _quantize_to_palette(img, palette_colors, dither_mode="none")
+
+    # 5. Tile-specific postprocessing for tile/world workflows.
+    if req.lane == "world" or req.output_mode == "tile_chunk":
+        if tile.seamless_mode:
+            img = _enforce_tile_seamlessness(
+                img,
+                edge_softening=tile.edge_softening,
+                noise_level=tile.noise_level,
+            )
+        if tile.autotile_mask != "none":
+            img = _apply_autotile_mask(img, tile.autotile_mask)
+
+    return img
+
+
+def _build_spritesheet(
+    img: Any,
+    frame_w: int,
+    frame_h: int,
+    columns: int,
+    rows: int,
+    padding: int,
+) -> tuple[Any, list[Any]]:
+    """Split generated image into grid cells and re-layout to exact frame geometry."""
+    from PIL import Image
+
+    src = img.convert("RGBA")
+    src_w, src_h = src.size
+    tile_w = max(1, src_w // max(1, columns))
+    tile_h = max(1, src_h // max(1, rows))
+
+    frames: list[Any] = []
+    for row in range(rows):
+        for col in range(columns):
+            left = col * tile_w
+            top = row * tile_h
+            right = src_w if col == columns - 1 else (col + 1) * tile_w
+            bottom = src_h if row == rows - 1 else (row + 1) * tile_h
+            tile = src.crop((left, top, right, bottom)).resize(
+                (frame_w, frame_h),
+                Image.Resampling.NEAREST,
+            )
+            frames.append(tile)
+
+    out_w = columns * frame_w + max(0, columns - 1) * padding
+    out_h = rows * frame_h + max(0, rows - 1) * padding
+    sheet = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+    for i, frame in enumerate(frames):
+        row = i // columns
+        col = i % columns
+        x = col * (frame_w + padding)
+        y = row * (frame_h + padding)
+        sheet.paste(frame, (x, y), frame)
+
+    return sheet, frames
+
+
+def _build_spritesheet_from_frames(
+    frames: list[Any],
+    frame_w: int,
+    frame_h: int,
+    columns: int,
+    rows: int,
+    padding: int,
+) -> Any:
+    from PIL import Image
+
+    out_w = columns * frame_w + max(0, columns - 1) * padding
+    out_h = rows * frame_h + max(0, rows - 1) * padding
+    sheet = Image.new("RGBA", (out_w, out_h), (0, 0, 0, 0))
+    for i, frame in enumerate(frames[: columns * rows]):
+        row = i // columns
+        col = i % columns
+        x = col * (frame_w + padding)
+        y = row * (frame_h + padding)
+        sheet.paste(frame.resize((frame_w, frame_h), Image.Resampling.NEAREST), (x, y), frame)
+    return sheet
+
+
+def _resolve_motion_prior(req: GenerateRequest) -> str:
+    allowed = {"auto", "bloom", "pulse", "sway", "rotate", "bounce", "flicker", "dissolve"}
+    requested = (req.motion_prior or "auto").strip().lower()
+    if requested not in allowed:
+        requested = "auto"
+    if requested != "auto":
+        return requested
+    by_lane = {
+        "sprite": "bounce",
+        "portrait": "sway",
+        "prop": "sway",
+        "world": "pulse",
+        "ui": "pulse",
+        "detail": "flicker",
+        "atmosphere": "dissolve",
+        "concept": "sway",
+    }
+    return by_lane.get(req.lane, "sway")
+
+
+def _generate_frame_variant(
+    keyframe: Any,
+    frame_index: int,
+    total_frames: int,
+    variation_strength: float,
+    motion_prior: str,
+) -> Any:
+    from PIL import Image, ImageEnhance
+
+    base = keyframe.convert("RGBA")
+    w, h = base.size
+    if total_frames <= 1:
+        return base
+
+    phase = frame_index / max(1, total_frames - 1)
+    t = phase * 2.0 * math.pi
+
+    if motion_prior == "bloom":
+        scale = 1.0 + 0.10 * variation_strength * math.sin(t)
+        dx = int(round(variation_strength * 2.5 * math.cos(t)))
+        dy = int(round(variation_strength * 2.5 * math.sin(t)))
+    elif motion_prior == "pulse":
+        scale = 1.0 + 0.08 * variation_strength * math.sin(t)
+        dx = 0
+        dy = 0
+    elif motion_prior == "rotate":
+        angle = 6.0 * variation_strength * math.sin(t)
+        base = base.rotate(angle, resample=Image.Resampling.NEAREST, expand=False)
+        scale = 1.0
+        dx = 0
+        dy = 0
+    elif motion_prior == "flicker":
+        scale = 1.0
+        dx = int(round(variation_strength * 1.5 * math.sin(t * 2.0)))
+        dy = int(round(variation_strength * 1.5 * math.cos(t * 2.0)))
+        alpha_factor = 1.0 - 0.10 * variation_strength * (0.5 + 0.5 * math.sin(t * 3.0))
+        alpha = ImageEnhance.Brightness(base.getchannel("A")).enhance(alpha_factor)
+        base.putalpha(alpha)
+    elif motion_prior == "dissolve":
+        scale = 1.0
+        dx = 0
+        dy = int(round(variation_strength * 2.0 * math.sin(t)))
+        alpha_factor = 1.0 - 0.15 * variation_strength * phase
+        alpha = ImageEnhance.Brightness(base.getchannel("A")).enhance(alpha_factor)
+        base.putalpha(alpha)
+    elif motion_prior == "bounce":
+        scale = 1.0
+        dx = int(round(variation_strength * 1.5 * math.sin(t)))
+        dy = int(round(variation_strength * 3.0 * abs(math.sin(t)) * -1.0))
+    else:  # sway
+        scale = 1.0
+        dx = int(round(variation_strength * 3.0 * math.sin(t)))
+        dy = int(round(variation_strength * 1.5 * math.cos(t)))
+
+    scaled_w = max(1, int(round(w * scale)))
+    scaled_h = max(1, int(round(h * scale)))
+    scaled = base.resize((scaled_w, scaled_h), Image.Resampling.NEAREST)
+    canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    x = (w - scaled_w) // 2 + dx
+    y = (h - scaled_h) // 2 + dy
+    canvas.paste(scaled, (x, y), scaled)
+    return canvas
+
+
+def _frame_consistency_score(keyframe: Any, frame: Any, palette_colors: list[str]) -> dict[str, float]:
+    try:
+        import numpy as np
+    except ImportError:
+        return {"score": 1.0, "silhouette": 1.0, "color": 1.0, "edge": 1.0}
+
+    k = np.array(keyframe.convert("RGBA"), dtype=np.uint8)
+    f = np.array(frame.convert("RGBA"), dtype=np.uint8)
+
+    k_mask = k[..., 3] > 0
+    f_mask = f[..., 3] > 0
+    inter = np.logical_and(k_mask, f_mask).sum()
+    union = np.logical_or(k_mask, f_mask).sum()
+    silhouette = float(inter / union) if union > 0 else 1.0
+
+    rgb_diff = np.abs(k[..., :3].astype(np.int16) - f[..., :3].astype(np.int16))
+    color = 1.0 - float(rgb_diff.mean() / 255.0)
+
+    edge_k = np.abs(np.diff(k_mask.astype(np.int8), axis=0)).sum() + np.abs(np.diff(k_mask.astype(np.int8), axis=1)).sum()
+    edge_f = np.abs(np.diff(f_mask.astype(np.int8), axis=0)).sum() + np.abs(np.diff(f_mask.astype(np.int8), axis=1)).sum()
+    edge = 1.0 - min(1.0, abs(float(edge_k - edge_f)) / max(1.0, float(edge_k + edge_f)))
+
+    if palette_colors:
+        color = min(1.0, color + 0.05)
+
+    score = 0.5 * silhouette + 0.35 * color + 0.15 * edge
+    return {"score": float(max(0.0, min(1.0, score))), "silhouette": float(silhouette), "color": float(color), "edge": float(edge)}
+
+
+def _build_keyframe_sequence(
+    keyframe: Any,
+    req: GenerateRequest,
+    palette_colors: list[str],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    total = max(1, req.sheet.columns * req.sheet.rows)
+    motion_prior = _resolve_motion_prior(req)
+    frames: list[Any] = [keyframe.convert("RGBA")]
+    scores: list[dict[str, Any]] = [
+        {"frame_index": 0, "score": 1.0, "silhouette": 1.0, "color": 1.0, "edge": 1.0, "attempts": 0}
+    ]
+
+    for i in range(1, total):
+        best_frame = frames[0]
+        best_metrics = {"score": -1.0, "silhouette": 0.0, "color": 0.0, "edge": 0.0}
+        attempts_used = 0
+
+        for attempt in range(req.frame_retry_budget + 1):
+            attempts_used = attempt + 1
+            strength = max(0.0, req.variation_strength * (1.0 - 0.30 * attempt))
+            candidate = _generate_frame_variant(frames[0], i, total, strength, motion_prior)
+            metrics = _frame_consistency_score(frames[0], candidate, palette_colors)
+            if metrics["score"] > best_metrics["score"]:
+                best_frame = candidate
+                best_metrics = metrics
+            if metrics["score"] >= req.consistency_threshold:
+                break
+
+        frames.append(best_frame)
+        scores.append(
+            {
+                "frame_index": i,
+                "score": best_metrics["score"],
+                "silhouette": best_metrics["silhouette"],
+                "color": best_metrics["color"],
+                "edge": best_metrics["edge"],
+                "attempts": attempts_used,
+            }
+        )
+
+    return frames, scores
+
+
+def _enhance_prompt(
+    prompt: str,
+    lane: str,
+    palette_colors: list[str],
+    palette_name: str,
+    strict_palette_lock: bool = False,
+    model_family: str = "",
+) -> str:
+    """Inject lane-specific pixel-art quality keywords into the prompt.
+
+    For fine-tuned pixel-art checkpoints (pixel_art_diffusion_xl) the style is
+    already trained in, so we use the checkpoint's own trigger words instead of
+    generic base tags that would conflict with its internal conditioning.
+    For sdxl_base + LoRA we add the full quality anchor set.
+    """
+    # Pixel-art checkpoints already have the style baked in.
+    # Use trigger words only; do NOT add generic style anchors.
+    _PIXEL_ART_CHECKPOINTS = {"pixel_art_diffusion_xl"}
+    if model_family in _PIXEL_ART_CHECKPOINTS:
+        # Trigger words from the model card: PIXEL ART at start, optional bit-depth hint
+        trigger = "PIXEL ART"
+        lane_depth_hint = {
+            "sprite": "32 BIT",
+            "portrait": "32 BIT",
+            "prop": "32 BIT",
+            "ui": "16 BIT",
+            "detail": "64 BIT",
+            "world": "16 BIT",
+            "atmosphere": "16 BIT",
+            "concept": "64 BIT",
+        }.get(lane, "32 BIT")
+        parts = [trigger, lane_depth_hint, prompt.rstrip(", ")]
+        if palette_name and palette_name.lower() != "custom":
+            parts.append(f"using the {palette_name} palette")
+        if strict_palette_lock and palette_colors:
+            n = len(palette_colors)
+            parts.append(f"strict {n}-colour palette, flat fills")
+        return ", ".join(parts)
+
+    # ── sdxl_base + LoRA path: full quality anchor set ───────────────────────
+    # Base pixel-art anchors that every lane benefits from
+    base_tags = (
+        "pixel art, pixelated, crisp pixels, clean pixel edges, "
+        "game sprite, 2D flat shading, no gradients, no blur"
+    )
+
+    lane_tags: dict[str, str] = {
+        "sprite": (
+            "single game character sprite, full body visible, "
+            "isolated on transparent background, orthographic front view, "
+            "clean silhouette, distinct outline"
+        ),
+        "portrait": (
+            "character portrait bust, face centered, "
+            "clear facial features readable at small size, "
+            "flat colour areas, limited shadow depth"
+        ),
+        "world": (
+            "isometric or top-down game tile, tileable, "
+            "fixed camera, readable terrain features, "
+            "no characters, environment only, flat perspective"
+        ),
+        "prop": (
+            "isolated game prop, single item, "
+            "transparent background, no characters, clean outline, "
+            "readable silhouette from above"
+        ),
+        "ui": (
+            "game UI element, flat design, icon style, "
+            "no inserted characters, no text, no letters, "
+            "geometric shapes, clean edges, interface component"
+        ),
+        "detail": (
+            "close-up texture detail, surface pattern, "
+            "tileable material, no characters, no full scene"
+        ),
+        "atmosphere": (
+            "atmospheric background element, sky or fog layer, "
+            "soft colour blends using limited palette, "
+            "no characters, no UI, depth layer"
+        ),
+        "concept": (
+            "concept art sketch, stylized illustration, "
+            "flat colour blocking, visible outlines"
+        ),
+    }
+
+    lane_hint = lane_tags.get(lane, "")
+
+    # Colour-budget hint steers SDXL toward lower-colour-count output
+    palette_hint = ""
+    if strict_palette_lock and palette_colors:
+        n = len(palette_colors)
+        palette_hint = f"strict {n}-colour palette, limited colour count, flat fills"
+    elif True:
+        # Default: push toward pixel-art-appropriate colour budgets
+        palette_hint = "limited colour palette, 16 colors max, flat fills"
+
+    parts = [prompt.rstrip(", "), base_tags]
+    if lane_hint:
+        parts.append(lane_hint)
+    if palette_name and palette_name.lower() != "custom":
+        parts.append(f"using the {palette_name} palette")
+    if palette_hint:
+        parts.append(palette_hint)
+
+    return ", ".join(parts)
 
 
 def _run_generation(record: JobRecord) -> None:
@@ -257,20 +1465,51 @@ def _run_generation(record: JobRecord) -> None:
     log.info("Job %s output dir: %s", record.job_id, job_dir)
 
     pipe = _load_pipeline(req.model_family)
+    palette_ctx = _resolve_palette_context(req.palette)
+    palette_colors: list[str] = palette_ctx["colors"]
+    palette_name: str = str(palette_ctx["label"])
+    strict_palette_lock = bool(palette_colors)
+    preset_ctx = _resolve_asset_preset_context(req)
+    dna_ctx = _resolve_character_dna_context(req.character_dna_id)
+    effective_pp = _resolve_effective_post_processing(req, preset_ctx)
 
-    # ── build palette conditioning suffix if colors provided ──────────────────
-    palette_hint = ""
-    if req.palette.colors:
-        # Avoid adding raw hex color strings to prompt text because CLIP token budget is small.
-        palette_hint = f", strict limited palette, {len(req.palette.colors)} colors"
+    prompt_prefix_parts: list[str] = []
+    preset_tags = preset_ctx.get("prompt_tags") if isinstance(preset_ctx.get("prompt_tags"), list) else []
+    if preset_tags:
+        prompt_prefix_parts.append(", ".join([str(tag).strip() for tag in preset_tags if str(tag).strip()]))
+    if dna_ctx and isinstance(dna_ctx.get("prompt_tags"), list):
+        prompt_prefix_parts.append(", ".join([str(tag).strip() for tag in dna_ctx["prompt_tags"] if str(tag).strip()]))
+    if req.tile_options.seamless_mode:
+        prompt_prefix_parts.append("seamless tile edges")
+    if req.tile_options.autotile_mask and req.tile_options.autotile_mask != "none":
+        prompt_prefix_parts.append(f"autotile mask {req.tile_options.autotile_mask}")
+    prompt_base = req.prompt
+    if prompt_prefix_parts:
+        prompt_base = f"{', '.join(prompt_prefix_parts)}, {prompt_base}"
 
-    full_prompt = req.prompt + palette_hint
+    # ── build prompt (base + optional lane-aware enhancement) ────────────────
+    if req.enhance_prompt:
+        full_prompt = _enhance_prompt(
+            prompt_base,
+            req.lane,
+            palette_colors,
+            palette_name,
+            strict_palette_lock,
+            req.model_family,
+        )
+    else:
+        palette_hint = ""
+        if palette_name and palette_name.lower() != "custom":
+            palette_hint += f", using the {palette_name} palette"
+        if palette_colors:
+            palette_hint += f", strict limited palette, {len(palette_colors)} colors"
+        full_prompt = prompt_base + palette_hint
     log.info(
         "Job %s prompt prepared | prompt_len=%d neg_len=%d palette_colors=%d",
         record.job_id,
         len(req.prompt),
         len(req.negative_prompt),
-        len(req.palette.colors),
+        len(palette_colors),
     )
 
     # ── source image for img2img (optional, with safe fallback) ───────────────
@@ -290,23 +1529,29 @@ def _run_generation(record: JobRecord) -> None:
     # ── determine output size ─────────────────────────────────────────────────
     w = req.sheet.frame_width
     h = req.sheet.frame_height
-    # SDXL works best at multiples of 64 and min 512
-    gen_w = max(512, (w * req.sheet.columns // 64) * 64)
-    gen_h = max(512, (h * req.sheet.rows // 64) * 64)
+    # Professional default: generate 8x per target frame, then snap to pixel grid.
+    # Keep multiples of 64 (SDXL sweet spot) and minimum 512 for model stability.
+    gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", "8")))
+    gen_w_raw = max(8, w) * gen_scale
+    gen_h_raw = max(8, h) * gen_scale
+    gen_w = max(512, ((gen_w_raw + 63) // 64) * 64)
+    gen_h = max(512, ((gen_h_raw + 63) // 64) * 64)
     log.info(
-        "Job %s target size: %dx%d (from frame=%dx%d, grid=%dx%d)",
+        "Job %s target size: %dx%d (frame=%dx%d, scale=%dx)",
         record.job_id,
         gen_w,
         gen_h,
         req.sheet.frame_width,
         req.sheet.frame_height,
-        req.sheet.columns,
-        req.sheet.rows,
+        gen_scale,
     )
 
     import torch
     generator = torch.Generator(device=pipe.device.type)
-    generator.manual_seed(int(time.time()) & 0xFFFFFFFF)
+    # seed=-1 means random; any other value is used directly for reproducibility
+    actual_seed = req.seed if req.seed >= 0 else int(time.time()) & 0xFFFFFFFF
+    generator.manual_seed(actual_seed)
+    log.info("Job %s seed=%d (requested=%d)", record.job_id, actual_seed, req.seed)
 
     num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", "30"))))
 
@@ -351,6 +1596,7 @@ def _run_generation(record: JobRecord) -> None:
                 "image": resized,
                 "strength": 0.75,
                 "num_inference_steps": num_steps,
+                "guidance_scale": req.cfg_scale,
                 "generator": generator,
             }
             img2img_kwargs = _with_progress_callbacks(img2img.__call__, img2img_kwargs)
@@ -368,19 +1614,82 @@ def _run_generation(record: JobRecord) -> None:
             "width": gen_w,
             "height": gen_h,
             "num_inference_steps": num_steps,
+            "guidance_scale": req.cfg_scale,
             "generator": generator,
         }
         txt2img_kwargs = _with_progress_callbacks(pipe.__call__, txt2img_kwargs)
         result_img = pipe(**txt2img_kwargs).images[0]
         log.info("Job %s txt2img finished in %.2fs", record.job_id, time.perf_counter() - t_txt2img)
 
+    # ── post-processing (optional, all opt-in) ────────────────────────────────
+    result_img = _apply_post_processing(result_img, req, effective_pp, palette_colors, palette_ctx["profile"])
+    effective_pixelate = bool(effective_pp.get("pixelate", False) or req.auto_pipeline)
+    effective_quantize = bool(effective_pp.get("quantize_palette", False) or (
+        req.auto_pipeline and bool(palette_colors)
+    ))
+    effective_cleanup = bool(effective_pp.get("pixel_cleanup", False) or req.auto_pipeline)
+    log.info(
+        "Job %s post-processing applied | auto=%s pixelate=%s remove_bg=%s quantize=%s cleanup=%s",
+        record.job_id,
+        req.auto_pipeline,
+        effective_pixelate,
+        bool(effective_pp.get("remove_background", False)),
+        effective_quantize,
+        effective_cleanup,
+    )
+
     # ── save outputs ──────────────────────────────────────────────────────────
     png_path = job_dir / "output.png"
     t_save = time.perf_counter()
-    result_img.save(str(png_path), format="PNG")
+    result_img.convert("RGBA").save(str(png_path), format="PNG")
 
     webp_path = job_dir / "output.webp"
-    result_img.save(str(webp_path), format="WEBP", lossless=True)
+    result_img.convert("RGBA").save(str(webp_path), format="WEBP", lossless=True)
+
+    gif_path = job_dir / "output.gif"
+    result_img.convert("RGB").convert("P", palette=Image.ADAPTIVE).save(
+        str(gif_path), format="GIF", save_all=False
+    )
+
+    spritesheet_path = job_dir / "output_sheet.png"
+    frame_scores: list[dict[str, Any]] = []
+    if req.keyframe_first and (req.sheet.columns * req.sheet.rows) > 1:
+        from PIL import Image
+
+        keyframe = result_img.convert("RGBA").resize(
+            (req.sheet.frame_width, req.sheet.frame_height),
+            Image.Resampling.NEAREST,
+        )
+        frames, frame_scores = _build_keyframe_sequence(keyframe, req, palette_colors)
+        sheet_img = _build_spritesheet_from_frames(
+            frames,
+            req.sheet.frame_width,
+            req.sheet.frame_height,
+            req.sheet.columns,
+            req.sheet.rows,
+            req.sheet.padding,
+        )
+        # Keep output preview dimensions stable while using keyframe-first sequence.
+        result_img = keyframe.resize((gen_w, gen_h), Image.Resampling.NEAREST)
+    else:
+        sheet_img, frames = _build_spritesheet(
+            result_img,
+            req.sheet.frame_width,
+            req.sheet.frame_height,
+            req.sheet.columns,
+            req.sheet.rows,
+            req.sheet.padding,
+        )
+    sheet_img.save(str(spritesheet_path), format="PNG")
+
+    frames_dir = job_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frame_urls: list[str] = []
+    for i, frame in enumerate(frames):
+        frame_name = f"frame_{i:03d}.png"
+        frame_path = frames_dir / frame_name
+        frame.save(str(frame_path), format="PNG")
+        frame_urls.append(f"/outputs/{record.job_id}/frames/{frame_name}")
 
     metadata = {
         "job_id": record.job_id,
@@ -389,24 +1698,78 @@ def _run_generation(record: JobRecord) -> None:
         "output_format": req.output_format,
         "model_family": req.model_family,
         "prompt": req.prompt,
+        "enhanced_prompt": full_prompt,
         "negative_prompt": req.negative_prompt,
+        "seed": actual_seed,
+        "cfg_scale": req.cfg_scale,
+        "enhance_prompt": req.enhance_prompt,
+        "auto_pipeline": req.auto_pipeline,
         "palette": req.palette.model_dump(),
+        "palette_resolved": {
+            "id": palette_ctx["id"],
+            "label": palette_name,
+            "colors": palette_colors,
+            "profile": palette_ctx["profile"],
+        },
         "sheet": req.sheet.model_dump(),
+        "tile_options": req.tile_options.model_dump(),
+        "asset_preset": {
+            "requested": req.asset_preset,
+            "resolved": preset_ctx,
+        },
+        "character_dna": dna_ctx,
+        "animation": {
+            "keyframe_first": req.keyframe_first,
+            "variation_strength": req.variation_strength,
+            "consistency_threshold": req.consistency_threshold,
+            "frame_retry_budget": req.frame_retry_budget,
+            "motion_prior": req.motion_prior,
+            "resolved_motion_prior": _resolve_motion_prior(req),
+            "frame_scores": frame_scores,
+        },
+        "post_processing": req.post_processing.model_dump(),
+        "effective_post_processing": effective_pp,
         "generated_size": {"width": gen_w, "height": gen_h},
+        "frames": {
+            "count": len(frames),
+            "layout": {
+                "columns": req.sheet.columns,
+                "rows": req.sheet.rows,
+                "padding": req.sheet.padding,
+                "frame_width": req.sheet.frame_width,
+                "frame_height": req.sheet.frame_height,
+            },
+        },
+        "generation_strategy": {
+            "mode": "per_frame_scaled",
+            "scale": gen_scale,
+            "raw": {"width": gen_w_raw, "height": gen_h_raw},
+            "aligned": {"width": gen_w, "height": gen_h},
+        },
     }
     meta_path = job_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2))
     log.info("Job %s files saved in %.2fs", record.job_id, time.perf_counter() - t_save)
 
     base = f"/outputs/{record.job_id}"
+    image_url_by_format = {
+        "png": f"{base}/output.png",
+        "webp": f"{base}/output.webp",
+        "gif": f"{base}/output.gif",
+        "spritesheet_png": f"{base}/output_sheet.png",
+    }
     record.status = "success"
     record.result = {
-        "image_url": f"{base}/output.png",
+        "image_url": image_url_by_format.get(req.output_format, f"{base}/output.png"),
+        "spritesheet_url": f"{base}/output_sheet.png",
+        "frame_urls": frame_urls,
+        "seed": actual_seed,
+        "enhanced_prompt": full_prompt,
         "download": {
             "png_url": f"{base}/output.png",
             "webp_url": f"{base}/output.webp",
-            "gif_url": "",
-            "spritesheet_png_url": f"{base}/output.png",
+            "gif_url": f"{base}/output.gif",
+            "spritesheet_png_url": f"{base}/output_sheet.png",
             "metadata_url": f"{base}/metadata.json",
         },
         "metadata": metadata,
@@ -445,14 +1808,32 @@ def create_app() -> FastAPI:
         models: list[dict[str, str]] = [
             {
                 "id": "sdxl_base",
-                "label": "SDXL Base 1.0 (no LoRA)",
-                "quality": "balanced",
+                "label": "PAD-XL SpriteShaper (active base)",
+                "quality": "pixel-checkpoint",
+            },
+            # ── pixel-art checkpoints (style baked in, no pixel-art LoRA needed) ─
+            {
+                "id": "pixel_art_diffusion_xl",
+                "label": "Pixel Art Diffusion XL SpriteShaper ★ Recommended",
+                "quality": "pixel-checkpoint",
             },
             {
+                "id": "sdxl_base_legacy",
+                "label": "SDXL Base 1.0 (legacy checkpoint)",
+                "quality": "balanced",
+            },
+            # ── sdxl_base + pixel-art LoRAs ─────────────────────────────────────
+            {
                 "id": "sdxl_pixel_art",
-                "label": "SDXL + 64x64 Pixel Art LoRA",
+                "label": "SDXL Base + 64×64 Pixel Art LoRA",
                 "quality": "pixel-optimized",
             },
+            {
+                "id": "sdxl_pixel_art_xl",
+                "label": "SDXL Base + Pixel Art XL v1.1 LoRA",
+                "quality": "pixel-optimized",
+            },
+            # ── general SDXL LoRAs (compatible with any checkpoint) ─────────────
             {
                 "id": "sdxl_swordsman",
                 "label": "SDXL + Swordsman LoRA",
@@ -465,9 +1846,11 @@ def create_app() -> FastAPI:
             },
         ]
 
+        # Known managed checkpoints – skip them from the dynamic catch-all
+        _known_checkpoints = set(_BASE_MODEL_CHECKPOINTS.values())
         for checkpoint in _list_local_checkpoints():
             dynamic_id = f"checkpoint:{checkpoint.name}"
-            if checkpoint.name == _BASE_MODEL_CHECKPOINTS.get("sdxl_base"):
+            if checkpoint.name in _known_checkpoints:
                 continue
             models.append(
                 {
@@ -492,17 +1875,21 @@ def create_app() -> FastAPI:
 
     @app.get("/api/pixel/palettes")
     def list_palettes() -> dict[str, list[dict[str, Any]]]:
-        return {
-            "palettes": [
-                {"id": "custom", "label": "Custom", "size": 16, "colors": []},
-                {
-                    "id": "gameboy",
-                    "label": "Game Boy",
-                    "size": 4,
-                    "colors": ["#0f380f", "#306230", "#8bac0f", "#9bbc0f"],
-                },
-            ]
-        }
+        catalog = _get_palette_catalog()
+        palettes = sorted(catalog.values(), key=lambda item: (item.get("id") != "custom", item.get("label", "")))
+        return {"palettes": palettes}
+
+    @app.get("/api/pixel/asset-presets")
+    def list_asset_presets() -> dict[str, list[dict[str, Any]]]:
+        catalog = _get_asset_preset_catalog()
+        presets = sorted(catalog.values(), key=lambda item: item.get("label", ""))
+        return {"presets": presets}
+
+    @app.get("/api/pixel/character-dna")
+    def list_character_dna() -> dict[str, list[dict[str, Any]]]:
+        catalog = _get_character_dna_catalog()
+        items = sorted(catalog.values(), key=lambda item: item.get("label", ""))
+        return {"character_dna": items}
 
     @app.get("/api/pixel/jobs")
     def list_jobs(search: str = "", status: str = "", limit: int = 50) -> dict[str, list[dict[str, Any]]]:
@@ -546,11 +1933,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/pixel/jobs/generate", response_model=JobResponse)
     def submit_generate(request: GenerateRequest) -> JobResponse:
-        if request.output_format not in {"png", "webp", "gif", "spritesheet_png"}:
-            raise HTTPException(
-                status_code=400,
-                detail="output_format must be one of: png, webp, gif, spritesheet_png",
-            )
+        _validate_generate_request(request)
 
         if request.source_image_base64 and not _is_base64_png(request.source_image_base64):
             raise HTTPException(status_code=400, detail="source_image_base64 must be a PNG in base64 format")
@@ -595,5 +1978,52 @@ def create_app() -> FastAPI:
         record.cancelled = True
         record.status = "cancelled"
         return {"job_id": job_id, "status": "cancelled"}
+
+    @app.post("/api/pixel/palettes/from-image")
+    async def palette_from_image(file: UploadFile = File(...)) -> dict[str, Any]:
+        """Extract a hex colour palette from an uploaded PNG swatch image.
+
+        Upload a small palette-swatch PNG (e.g. a 16×1 or 32×1 image where
+        each pixel is one palette colour).  The endpoint returns the unique
+        colours as ``#RRGGBB`` hex strings, ready to paste into
+        ``palette.colors`` on a generate request.
+
+        Limits:
+        - Max 2 MB file size.
+        - Max 256 unique colours (use a palette-swatch, not a full photo).
+        """
+        import io as _io
+
+        from PIL import Image
+
+        MAX_BYTES = 2 * 1024 * 1024
+        data = await file.read(MAX_BYTES + 1)
+        if len(data) > MAX_BYTES:
+            raise HTTPException(status_code=400, detail="palette image too large (max 2 MB)")
+
+        try:
+            img = Image.open(_io.BytesIO(data)).convert("RGB")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="could not open image as RGB") from exc
+
+        # getcolors(maxcolors) returns None if there are more unique colours than maxcolors.
+        # This is the most efficient way to detect and reject overly complex images.
+        MAX_COLORS = 256
+        color_data = img.getcolors(maxcolors=MAX_COLORS)
+        if color_data is None:
+            # Count the actual number to include in the error message
+            all_colors = img.getcolors(maxcolors=img.width * img.height) or []
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"image has {len(all_colors)} unique colours; max {MAX_COLORS}. "
+                    "Upload a palette-swatch image, not a full photo."
+                ),
+            )
+
+        # Sort by descending frequency, then by colour value for stable ordering
+        color_data.sort(key=lambda item: (-item[0], item[1]))
+        hex_colors = [f"#{r:02x}{g:02x}{b:02x}" for _, (r, g, b) in color_data]
+        return {"colors": hex_colors, "count": len(hex_colors)}
 
     return app

@@ -66,8 +66,8 @@ Required controls:
    - Options from `GET /api/pixel/models`
    - Must include label and cost hint where available
    - Default recommendation:
-     - `oai_gpt2_medium` for balanced quality
-     - `oai_gpt2_low` for cheap iteration
+       - `sdxl_pixel_art` for pixel-focused generation
+       - `sdxl_base` for baseline and debugging
 
 2. Prompt section
    - Prompt field (required)
@@ -91,6 +91,7 @@ Required controls:
    - columns
    - rows
    - padding
+   - default working size: 64x64
 
 6. Source image
    - optional PNG upload
@@ -99,6 +100,43 @@ Required controls:
 7. Submit area
    - generation cost/tip hint
    - Submit Generation button
+
+Settings persistence:
+
+- frontend should persist user control selections between restarts (model, lane, output mode/format, palette choices, sheet/tile controls, post-processing, generation controls, and keyframe-first controls)
+- history/starred state should continue to persist with quota-safe localStorage behavior
+
+8. Cleanup tuning (advanced)
+   - outline-strength (0-3)
+   - anti-alias removal level (0-3)
+   - cluster smoothing (0-3)
+   - contrast boost (0-2)
+   - shadow reinforcement (0-2)
+   - highlight reinforcement (0-2)
+   - palette strictness (0-2)
+
+9. Asset consistency controls
+   - asset preset selector
+   - optional character DNA selector
+
+10. Tile controls
+   - tile size
+   - seamless mode
+   - autotile mask
+   - variation count
+   - noise level
+   - edge softening
+
+11. Keyframe-first animation controls
+   - keyframe-first toggle
+   - motion prior selector
+   - variation strength slider
+   - consistency threshold slider
+   - frame retry budget
+
+12. Quality profile controls
+   - quality profile selector (`production` / `experimental`)
+   - `Reset to production defaults` action for fast recovery from bad settings
 
 ### Right Column: Results
 
@@ -169,11 +207,11 @@ Recommended tips:
 
 ### Main Character (Single Frame)
 
-"Create a single-frame game-ready pixel art main character sprite for an isometric 2.5D action RPG. Young male wanderer, medium-narrow silhouette, practical layered traveler clothing, neutral ready stance, calm alert expression, 3/4 isometric-friendly view, clean pixel art, 48x48, transparent background, no text, no UI, no environment."
+"Create a single-frame game-ready pixel art main character sprite for an isometric 2.5D action RPG. Young male wanderer, medium-narrow silhouette, practical layered traveler clothing, neutral ready stance, calm alert expression, 3/4 isometric-friendly view, clean pixel art, 64x64, transparent background, no text, no UI, no environment."
 
 ### Enemy Sprite Sheet (12 Frames)
 
-"Create a game-ready pixel art enemy sprite sheet for an isometric 2.5D action RPG. Frog-like tower guardian scout, ritual and ancient machine tone, readable silhouette, 12 frames total (4 idle, 4 walk, 4 attack), each 48x48, single row spritesheet, transparent background, no text, no UI, no environment."
+"Create a game-ready pixel art enemy sprite sheet for an isometric 2.5D action RPG. Frog-like tower guardian scout, ritual and ancient machine tone, readable silhouette, 12 frames total (4 idle, 4 walk, 4 attack), each 64x64, single row spritesheet, transparent background, no text, no UI, no environment."
 
 ## Backend Integration Map
 
@@ -202,11 +240,20 @@ Frontend must send:
 - `output_format`
 - `palette`
 - `sheet`
+- `auto_pipeline` (default true for production-safe pixel results)
 - optional `source_image_base64`
+- optional keyframe-first animation fields:
+   - `keyframe_first`
+   - `variation_strength`
+   - `consistency_threshold`
+   - `frame_retry_budget`
+   - `motion_prior`
 
 ### Result handling
 
 Use `result.download` links for all download actions.
+
+If present, use `result.frame_urls` to render per-frame previews for spritesheet workflows.
 
 ## Quality Rules For Implementation
 
