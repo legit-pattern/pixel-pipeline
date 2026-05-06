@@ -243,18 +243,22 @@ function resolveBackendUrl(value: string | undefined): string | undefined {
     return value;
   }
   const normalized = value.trim();
+  const withoutLeadingSlashes = normalized.replace(/^\/+/, "");
 
   // Ephemeral output may return inline data/blob URLs; keep them as-is.
   if (/^(https?:\/\/|data:|blob:)/i.test(normalized)) {
     return normalized;
   }
+  // Some callers may accidentally prefix inline URLs with one or more '/'.
+  if (/^(https?:\/\/|data:|blob:)/i.test(withoutLeadingSlashes)) {
+    return withoutLeadingSlashes;
+  }
 
   // Some older clients/storage states may hold URL-encoded schemes such as
   // "data%3Aimage/..." (sometimes slash-prefixed as "/data%3A...").
-  const encodedScheme = normalized.replace(/^\/+/, "");
-  if (/^(data%3a|blob%3a|https?%3a%2f%2f)/i.test(encodedScheme)) {
+  if (/^(data%3a|blob%3a|https?%3a%2f%2f)/i.test(withoutLeadingSlashes)) {
     try {
-      return decodeURIComponent(encodedScheme);
+      return decodeURIComponent(withoutLeadingSlashes);
     } catch {
       // Fall back to backend URL resolution below if decode fails.
     }
