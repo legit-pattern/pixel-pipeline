@@ -61,6 +61,14 @@ def test_runtime_contract() -> None:
     assert isinstance(payload["generation_metrics"]["recent_jobs"], list)
 
 
+def test_runtime_includes_request_id_header() -> None:
+    response = client.get("/api/pixel/runtime")
+    assert response.status_code == 200
+    request_id = response.headers.get("X-Request-ID")
+    assert request_id is not None
+    assert len(request_id) == 12
+
+
 def test_startup_checks_structure() -> None:
     """Verify startup checks report checkpoint and compatibility status."""
     response = client.get("/api/pixel/runtime")
@@ -897,3 +905,68 @@ def test_cancel_after_success_returns_terminal_success(monkeypatch) -> None:
     cancel = client.post(f"/api/pixel/jobs/{job_id}/cancel")
     assert cancel.status_code == 200
     assert cancel.json()["status"] == "success"
+
+
+def test_build_prompt_base_includes_prefix_inputs() -> None:
+    from pixel_backend.app import GenerateRequest, _build_prompt_base
+
+    req = GenerateRequest(
+        prompt="hero sprite",
+        tile_options={"seamless_mode": True, "autotile_mask": "terrain"},
+    )
+    preset_ctx = {"prompt_tags": ["clean silhouette", "pixel readability"]}
+    dna_ctx = {"prompt_tags": ["same character identity"]}
+
+    prompt_base = _build_prompt_base(req, preset_ctx, dna_ctx)
+
+    assert "clean silhouette" in prompt_base
+    assert "pixel readability" in prompt_base
+    assert "same character identity" in prompt_base
+    assert "seamless tile edges" in prompt_base
+    assert "autotile mask terrain" in prompt_base
+    assert prompt_base.endswith("hero sprite")
+
+
+def test_resolve_generation_dimensions_aligns_to_64(monkeypatch) -> None:
+    from pixel_backend.app import GenerateRequest, _resolve_generation_dimensions
+
+    req = GenerateRequest(prompt="dim test", sheet={"frame_width": 17, "frame_height": 19})
+    defaults = {"gen_scale": 6, "min_gen_size": 512, "num_steps": 20}
+
+    monkeypatch.setenv("PIXEL_GEN_SCALE", "7")
+    monkeypatch.setenv("PIXEL_MIN_GEN_SIZE", "510")
+
+    gen_w, gen_h, gen_scale, min_gen_size, gen_w_raw, gen_h_raw = _resolve_generation_dimensions(req, defaults)
+
+    assert gen_scale == 7
+    assert min_gen_size == 512
+    assert gen_w_raw == 119
+    assert gen_h_raw == 133
+    assert gen_w % 64 == 0
+    assert gen_h % 64 == 0
+    assert gen_w >= min_gen_size
+    assert gen_h >= min_gen_size
+
+
+def test_prepare_generation_context_returns_expected_shapes() -> None:
+    from pixel_backend.app import GenerateRequest, _prepare_generation_context
+
+    req = GenerateRequest(prompt="context test", lane="sprite")
+    (
+        palette_ctx,
+        palette_colors,
+        palette_name,
+        preset_ctx,
+        dna_ctx,
+        effective_pp,
+        full_prompt,
+    ) = _prepare_generation_context(req, "job-test")
+
+    assert isinstance(palette_ctx, dict)
+    assert isinstance(palette_colors, list)
+    assert isinstance(palette_name, str)
+    assert isinstance(preset_ctx, dict)
+    assert dna_ctx is None or isinstance(dna_ctx, dict)
+    assert isinstance(effective_pp, dict)
+    assert isinstance(full_prompt, str)
+    assert "context test" in full_prompt

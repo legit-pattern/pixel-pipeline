@@ -32,6 +32,29 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 _LOGGING_CONFIGURED = False
+_HTTP_LOG_SUPPRESSED_PATHS = {"/healthz"}
+
+
+def _format_log_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    text = str(value)
+    return text.replace("\n", "\\n")
+
+
+def _format_log_fields(**fields: Any) -> str:
+    parts: list[str] = []
+    for key in sorted(fields):
+        parts.append(f"{key}={_format_log_value(fields[key])}")
+    return " ".join(parts)
+
+
+def _log_event(level: int, event: str, **fields: Any) -> None:
+    details = _format_log_fields(**fields)
+    if details:
+        log.log(level, "%s | %s", event, details)
+    else:
+        log.log(level, "%s", event)
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -3255,59 +3278,7 @@ def _trim_to_clip_budget(text: str, max_tokens: int = 75) -> str:
     return ", ".join(kept)
 
 
-def _run_generation(record: JobRecord) -> None:
-    """Execute SDXL generation and produce either persisted files or ephemeral data URLs."""
-    import torch
-    from PIL import Image
-
-    req = record.request
-    record.phase = "preparing"
-    record.progress_step = None
-    record.progress_total = None
-    t_job = time.perf_counter()
-    timing: dict[str, Any] = {
-        "source_decode_s": 0.0,
-        "source_processing_s": 0.0,
-        "pipeline_load_s": 0.0,
-        "inference_s": 0.0,
-        "inference_mode": "txt2img",
-        "post_processing_s": 0.0,
-        "save_outputs_s": 0.0,
-        "total_s": 0.0,
-        "cuda_peak_allocated_mb": None,
-        "cuda_peak_reserved_mb": None,
-    }
-    log.info(
-        "Job %s start | model=%s lane=%s mode=%s format=%s",
-        record.job_id,
-        req.model_family,
-        req.lane,
-        req.output_mode,
-        req.output_format,
-    )
-    if req.ephemeral_output:
-        log.info("Job %s running with ephemeral output mode (no disk persistence)", record.job_id)
-    else:
-        job_dir = _OUTPUT_DIR / record.job_id
-        job_dir.mkdir(exist_ok=True)
-        log.info("Job %s output dir: %s", record.job_id, job_dir)
-
-    execution_device = _resolve_execution_device(torch)
-    if execution_device != "cuda":
-        log.warning(
-            "Job %s running in CPU fallback mode (PIXEL_EXECUTION_DEVICE=%s)",
-            record.job_id,
-            os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
-        )
-
-    palette_ctx = _resolve_palette_context(req.palette)
-    palette_colors: list[str] = palette_ctx["colors"]
-    palette_name: str = str(palette_ctx["label"])
-    strict_palette_lock = bool(palette_colors)
-    preset_ctx = _resolve_asset_preset_context(req)
-    dna_ctx = _resolve_character_dna_context(req.character_dna_id)
-    effective_pp = _resolve_effective_post_processing(req, preset_ctx)
-
+def _build_prompt_base(req: GenerateRequest, preset_ctx: dict[str, Any], dna_ctx: dict[str, Any] | None) -> str:
     prompt_prefix_parts: list[str] = []
     preset_tags = preset_ctx.get("prompt_tags") if isinstance(preset_ctx.get("prompt_tags"), list) else []
     if preset_tags:
@@ -3318,13 +3289,25 @@ def _run_generation(record: JobRecord) -> None:
         prompt_prefix_parts.append("seamless tile edges")
     if req.tile_options.autotile_mask and req.tile_options.autotile_mask != "none":
         prompt_prefix_parts.append(f"autotile mask {req.tile_options.autotile_mask}")
-    prompt_base = req.prompt
-    if prompt_prefix_parts:
-        prompt_base = f"{', '.join(prompt_prefix_parts)}, {prompt_base}"
+
+    if not prompt_prefix_parts:
+        return req.prompt
+    return f"{', '.join(prompt_prefix_parts)}, {req.prompt}"
+
+
+def _build_full_prompt(
+    req: GenerateRequest,
+    preset_ctx: dict[str, Any],
+    dna_ctx: dict[str, Any] | None,
+    palette_colors: list[str],
+    palette_name: str,
+) -> str:
+    prompt_base = _build_prompt_base(req, preset_ctx, dna_ctx)
+    strict_palette_lock = bool(palette_colors)
 
     # ── build prompt (base + optional lane-aware enhancement) ────────────────
     if req.enhance_prompt:
-        full_prompt = _enhance_prompt(
+        return _enhance_prompt(
             prompt_base,
             req.lane,
             palette_colors,
@@ -3334,78 +3317,31 @@ def _run_generation(record: JobRecord) -> None:
             iso_elevation=req.iso_elevation,
             iso_azimuth=req.iso_azimuth,
         )
-    else:
-        # Even with enhance disabled, inject the model trigger so the checkpoint
-        # activates its own conditioning. This is a ≤6-token overhead.
-        trigger = _get_model_trigger(req.model_family, req.lane)
-        palette_hint = ""
-        if palette_name and palette_name.lower() != "custom":
-            palette_hint += f", using the {palette_name} palette"
-        if palette_colors:
-            palette_hint += f", strict limited palette, {len(palette_colors)} colors"
-        if trigger:
-            full_prompt = f"{trigger}, {prompt_base}{palette_hint}"
-        else:
-            full_prompt = prompt_base + palette_hint
-    log.info(
-        "Job %s prompt prepared | prompt_len=%d neg_len=%d palette_colors=%d",
-        record.job_id,
-        len(req.prompt),
-        len(req.negative_prompt),
-        len(palette_colors),
-    )
 
-    # ── source image for img2img (optional, with safe fallback) ───────────────
-    init_image: Image.Image | None = None
-    source_analysis: SourceAnalysis | None = None
-    control_image: Image.Image | None = None
-    control_metadata: dict[str, Any] | None = None
+    # Even with enhance disabled, inject the model trigger so the checkpoint
+    # activates its own conditioning. This is a <=6-token overhead.
+    trigger = _get_model_trigger(req.model_family, req.lane)
+    palette_hint = ""
+    if palette_name and palette_name.lower() != "custom":
+        palette_hint += f", using the {palette_name} palette"
+    if palette_colors:
+        palette_hint += f", strict limited palette, {len(palette_colors)} colors"
+    if trigger:
+        return f"{trigger}, {prompt_base}{palette_hint}"
+    return prompt_base + palette_hint
 
-    # Synthetic iso depth guide: auto-activate depth ControlNet for iso lane
-    # when the caller has not supplied a source image but iso_depth_guide=True.
-    effective_control_mode = req.control_mode
-    if req.iso_depth_guide and req.lane == "iso" and not req.source_image_base64:
-        effective_control_mode = "depth"
 
-    if req.source_image_base64:
-        t_decode = time.perf_counter()
-        raw = base64.b64decode(req.source_image_base64)
-        init_image = Image.open(io.BytesIO(raw)).convert("RGBA")
-        timing["source_decode_s"] = round(time.perf_counter() - t_decode, 4)
-        log.info(
-            "Job %s source image decoded in %.2fs (%dx%d)",
-            record.job_id,
-            timing["source_decode_s"],
-            init_image.width,
-            init_image.height,
-        )
-
-        t_source = time.perf_counter()
-        processed_source, source_analysis = _apply_source_processing(init_image.convert("RGB"), req)
-        init_image = processed_source.convert("RGBA")
-        timing["source_processing_s"] = round(time.perf_counter() - t_source, 4)
-        log.info(
-            "Job %s source processing in %.2fs | mode=%s steps=%s",
-            record.job_id,
-            timing["source_processing_s"],
-            req.source_processing_mode,
-            source_analysis.processing_applied if source_analysis else [],
-        )
-
-    t_pipe = time.perf_counter()
-    pipe = _load_pipeline(req.model_family, effective_control_mode)
-    timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
-
-    # ── determine output size ─────────────────────────────────────────────────
-    w = req.sheet.frame_width
-    h = req.sheet.frame_height
+def _resolve_profile_defaults() -> dict[str, int]:
     resource_profile = _resolve_resource_profile()
     profile_defaults: dict[str, dict[str, int]] = {
         "daily": {"gen_scale": 4, "min_gen_size": 384, "num_steps": 14},
         "balanced": {"gen_scale": 6, "min_gen_size": 512, "num_steps": 20},
         "max": {"gen_scale": 8, "min_gen_size": 640, "num_steps": 28},
     }
-    defaults = profile_defaults.get(resource_profile, profile_defaults["daily"])
+    return profile_defaults.get(resource_profile, profile_defaults["daily"])
+
+
+def _resolve_generation_dimensions(req: GenerateRequest, defaults: dict[str, int]) -> tuple[int, int, int, int, int, int]:
     # Balanced-fast default: generate 6x per target frame, then snap to pixel grid.
     # Keep multiples of 64 (SDXL sweet spot). Default minimum is 512 for SDXL
     # composition quality before pixel-art post-processing.
@@ -3413,195 +3349,289 @@ def _run_generation(record: JobRecord) -> None:
     min_gen_default = str(defaults["min_gen_size"])
     min_gen_size = max(256, int(os.getenv("PIXEL_MIN_GEN_SIZE", min_gen_default)))
     min_gen_size = ((min_gen_size + 63) // 64) * 64
-    gen_w_raw = max(8, w) * gen_scale
-    gen_h_raw = max(8, h) * gen_scale
+    gen_w_raw = max(8, req.sheet.frame_width) * gen_scale
+    gen_h_raw = max(8, req.sheet.frame_height) * gen_scale
     gen_w = max(min_gen_size, ((gen_w_raw + 63) // 64) * 64)
     gen_h = max(min_gen_size, ((gen_h_raw + 63) // 64) * 64)
+    return gen_w, gen_h, gen_scale, min_gen_size, gen_w_raw, gen_h_raw
+
+
+def _resolve_num_steps(defaults: dict[str, int]) -> int:
+    # Profile-aware defaults keep daily mode responsive while still allowing overrides.
+    return max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", str(defaults["num_steps"])))))
+
+
+def _resolve_effective_control_mode(req: GenerateRequest) -> str:
+    # Synthetic iso depth guide: auto-activate depth ControlNet for iso lane
+    # when the caller has not supplied a source image but iso_depth_guide=True.
+    if req.iso_depth_guide and req.lane == "iso" and not req.source_image_base64:
+        return "depth"
+    return req.control_mode
+
+
+def _decode_and_process_source_image(
+    req: GenerateRequest,
+    job_id: str,
+    timing: dict[str, Any],
+) -> tuple[PIL.Image.Image | None, SourceAnalysis | None]:
+    from PIL import Image
+
+    if not req.source_image_base64:
+        return None, None
+
+    t_decode = time.perf_counter()
+    raw = base64.b64decode(req.source_image_base64)
+    init_image = Image.open(io.BytesIO(raw)).convert("RGBA")
+    timing["source_decode_s"] = round(time.perf_counter() - t_decode, 4)
     log.info(
-        "Job %s target size: %dx%d (frame=%dx%d, scale=%dx, min_gen=%d)",
-        record.job_id,
-        gen_w,
-        gen_h,
-        req.sheet.frame_width,
-        req.sheet.frame_height,
-        gen_scale,
-        min_gen_size,
+        "Job %s source image decoded in %.2fs (%dx%d)",
+        job_id,
+        timing["source_decode_s"],
+        init_image.width,
+        init_image.height,
     )
 
-    if effective_control_mode != "none":
-        t_control = time.perf_counter()
-        if req.iso_depth_guide and req.lane == "iso" and init_image is None:
-            # No source image supplied: generate a synthetic isometric depth map
-            control_image = _generate_synthetic_iso_depth(
-                req.iso_elevation, req.iso_azimuth, gen_w, gen_h
-            )
-            control_metadata = {
-                "mode": "depth",
-                "guide_size": {"width": gen_w, "height": gen_h},
-                "preprocess": "synthetic_iso",
-                "elevation_deg": req.iso_elevation,
-                "azimuth_deg": req.iso_azimuth,
-            }
-        elif init_image is not None:
-            control_image, control_metadata = _build_control_image(
-                init_image, effective_control_mode, gen_w, gen_h
-            )
-        log.info(
-            "Job %s control guide prepared in %.2fs | mode=%s size=%dx%d",
-            record.job_id,
-            time.perf_counter() - t_control,
-            effective_control_mode,
-            gen_w,
-            gen_h,
-        )
+    t_source = time.perf_counter()
+    processed_source, source_analysis = _apply_source_processing(init_image.convert("RGB"), req)
+    init_image = processed_source.convert("RGBA")
+    timing["source_processing_s"] = round(time.perf_counter() - t_source, 4)
+    log.info(
+        "Job %s source processing in %.2fs | mode=%s steps=%s",
+        job_id,
+        timing["source_processing_s"],
+        req.source_processing_mode,
+        source_analysis.processing_applied if source_analysis else [],
+    )
+    return init_image, source_analysis
 
-    import torch
-    # With CPU offload enabled, pipe.device can be "meta". Generator must target
-    # a real execution device, not the internal placeholder device.
-    execution_device = _resolve_execution_device(torch)
-    generator = torch.Generator(device=execution_device)
-    if execution_device == "cuda":
-        try:
-            torch.cuda.reset_peak_memory_stats()
-        except Exception:
-            # Keep generation resilient if memory stats are unavailable.
-            pass
-    # seed=-1 means random; any other value is used directly for reproducibility
-    actual_seed = req.seed if req.seed >= 0 else int.from_bytes(os.urandom(4), "little")
-    generator.manual_seed(actual_seed)
-    log.info("Job %s seed=%d (requested=%d)", record.job_id, actual_seed, req.seed)
 
-    # Profile-aware defaults keep daily mode responsive while still allowing overrides.
-    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", str(defaults["num_steps"])))))
-    record.progress_total = num_steps
-    record.progress_step = 0
+def _prepare_control_guide(
+    req: GenerateRequest,
+    init_image: PIL.Image.Image | None,
+    effective_control_mode: str,
+    gen_w: int,
+    gen_h: int,
+    job_id: str,
+) -> tuple[PIL.Image.Image | None, dict[str, Any] | None]:
+    if effective_control_mode == "none":
+        return None, None
 
-    def _log_step(step: int) -> None:
-        record.phase = "inference"
-        record.progress_step = min(num_steps, max(0, step + 1))
-        if step == 0 or (step + 1) % 5 == 0 or (step + 1) == num_steps:
-            log.info("Job %s progress: step %d/%d", record.job_id, step + 1, num_steps)
+    t_control = time.perf_counter()
+    control_image: PIL.Image.Image | None = None
+    control_metadata: dict[str, Any] | None = None
+    if req.iso_depth_guide and req.lane == "iso" and init_image is None:
+        # No source image supplied: generate a synthetic isometric depth map
+        control_image = _generate_synthetic_iso_depth(req.iso_elevation, req.iso_azimuth, gen_w, gen_h)
+        control_metadata = {
+            "mode": "depth",
+            "guide_size": {"width": gen_w, "height": gen_h},
+            "preprocess": "synthetic_iso",
+            "elevation_deg": req.iso_elevation,
+            "azimuth_deg": req.iso_azimuth,
+        }
+    elif init_image is not None:
+        control_image, control_metadata = _build_control_image(init_image, effective_control_mode, gen_w, gen_h)
 
-    def _step_callback_new(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
-        _log_step(step)
-        return callback_kwargs
+    log.info(
+        "Job %s control guide prepared in %.2fs | mode=%s size=%dx%d",
+        job_id,
+        time.perf_counter() - t_control,
+        effective_control_mode,
+        gen_w,
+        gen_h,
+    )
+    return control_image, control_metadata
 
-    def _step_callback_legacy(step: int, _timestep: Any, _latents: Any) -> None:
-        _log_step(step)
 
-    def _with_progress_callbacks(pipeline_call: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
-        try:
-            params = inspect.signature(pipeline_call).parameters
-        except Exception:
-            return kwargs
-
-        if "callback_on_step_end" in params:
-            kwargs["callback_on_step_end"] = _step_callback_new
-        elif "callback" in params and "callback_steps" in params:
-            kwargs["callback"] = _step_callback_legacy
-            kwargs["callback_steps"] = 1
+def _with_progress_callbacks(
+    pipeline_call: Any,
+    kwargs: dict[str, Any],
+    on_step: Any,
+) -> dict[str, Any]:
+    try:
+        params = inspect.signature(pipeline_call).parameters
+    except Exception:
         return kwargs
 
-    # Try img2img only when a source image is provided; on compatibility errors,
-    # fallback to txt2img so the job still succeeds and returns real outputs.
-    result_img = None
-    if init_image is not None and req.control_mode == "none":
-        try:
-            from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
-                StableDiffusionXLImg2ImgPipeline,
-            )
+    if "callback_on_step_end" in params:
+        def _step_callback_new(_pipe: Any, step: int, _timestep: Any, callback_kwargs: dict[str, Any]) -> dict[str, Any]:
+            on_step(step)
+            return callback_kwargs
 
-            t_img2img = time.perf_counter()
-            log.info("Job %s starting img2img inference", record.job_id)
-            img2img = StableDiffusionXLImg2ImgPipeline(**pipe.components)
-            if torch.cuda.is_available():
-                offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
-                if offload_mode == "model":
-                    img2img.enable_model_cpu_offload()
-                else:
-                    img2img.enable_sequential_cpu_offload()
-            else:
-                img2img = img2img.to(pipe.device)
-            resized = init_image.convert("RGB").resize((gen_w, gen_h))
-            img2img_kwargs = {
-                "prompt": full_prompt,
-                "negative_prompt": req.negative_prompt or None,
-                "image": resized,
-                "strength": 0.75,
-                "num_inference_steps": num_steps,
-                "guidance_scale": req.cfg_scale,
-                "generator": generator,
-            }
-            img2img_kwargs = _with_progress_callbacks(img2img.__call__, img2img_kwargs)
-            img2img_out = cast(Any, img2img(**img2img_kwargs))
-            result_img = img2img_out.images[0]
-            timing["inference_s"] = round(time.perf_counter() - t_img2img, 4)
-            timing["inference_mode"] = "img2img"
-            log.info("Job %s img2img finished in %.2fs", record.job_id, timing["inference_s"])
-        except Exception as exc:
-            log.warning("Img2img fallback to txt2img for job %s: %s", record.job_id, exc)
+        kwargs["callback_on_step_end"] = _step_callback_new
+    elif "callback" in params and "callback_steps" in params:
+        def _step_callback_legacy(step: int, _timestep: Any, _latents: Any) -> None:
+            on_step(step)
 
-    if result_img is None:
-        t_txt2img = time.perf_counter()
-        log.info("Job %s starting txt2img inference", record.job_id)
-        # Auto-inject iso anti-drift negatives when in iso lane.
-        # Prevents SDXL from slipping to front-view / top-down / perspective shots.
-        _ISO_NEGATIVE = (
-            "front view, side view, top-down, flat overhead, bird's eye, "
-            "aerial view, straight-on, perspective distortion, first person, "
-            "3/4 front view, close-up, no depth, flat projection"
+        kwargs["callback"] = _step_callback_legacy
+        kwargs["callback_steps"] = 1
+    return kwargs
+
+
+def _run_img2img_inference(
+    record: JobRecord,
+    req: GenerateRequest,
+    pipe: Any,
+    init_image: PIL.Image.Image,
+    gen_w: int,
+    gen_h: int,
+    num_steps: int,
+    full_prompt: str,
+    generator: Any,
+    torch_module: Any,
+    timing: dict[str, Any],
+    on_step: Any,
+) -> PIL.Image.Image | None:
+    try:
+        from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
+            StableDiffusionXLImg2ImgPipeline,
         )
-        effective_negative = req.negative_prompt or ""
-        if req.lane == "iso" and _ISO_NEGATIVE not in effective_negative:
-            effective_negative = (_ISO_NEGATIVE + ", " + effective_negative).strip(", ")
-        txt2img_kwargs = {
+
+        t_img2img = time.perf_counter()
+        log.info("Job %s starting img2img inference", record.job_id)
+        img2img = StableDiffusionXLImg2ImgPipeline(**pipe.components)
+        if torch_module.cuda.is_available():
+            offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
+            if offload_mode == "model":
+                img2img.enable_model_cpu_offload()
+            else:
+                img2img.enable_sequential_cpu_offload()
+        else:
+            img2img = img2img.to(pipe.device)
+        resized = init_image.convert("RGB").resize((gen_w, gen_h))
+        img2img_kwargs = {
             "prompt": full_prompt,
-            "negative_prompt": effective_negative or None,
-            "width": gen_w,
-            "height": gen_h,
+            "negative_prompt": req.negative_prompt or None,
+            "image": resized,
+            "strength": 0.75,
             "num_inference_steps": num_steps,
             "guidance_scale": req.cfg_scale,
             "generator": generator,
         }
-        if effective_control_mode != "none" and control_image is not None:
-            txt2img_kwargs["image"] = control_image
-            txt2img_kwargs["controlnet_conditioning_scale"] = req.control_strength
-            txt2img_kwargs["control_guidance_start"] = req.control_start
-            txt2img_kwargs["control_guidance_end"] = req.control_end
-        txt2img_kwargs = _with_progress_callbacks(pipe.__call__, txt2img_kwargs)
-        result_img = pipe(**txt2img_kwargs).images[0]
-        timing["inference_s"] = round(time.perf_counter() - t_txt2img, 4)
-        timing["inference_mode"] = "txt2img"
-        log.info("Job %s txt2img finished in %.2fs", record.job_id, timing["inference_s"])
+        img2img_kwargs = _with_progress_callbacks(img2img.__call__, img2img_kwargs, on_step)
+        img2img_out = cast(Any, img2img(**img2img_kwargs))
+        result_img = img2img_out.images[0]
+        timing["inference_s"] = round(time.perf_counter() - t_img2img, 4)
+        timing["inference_mode"] = "img2img"
+        log.info("Job %s img2img finished in %.2fs", record.job_id, timing["inference_s"])
+        return result_img
+    except Exception as exc:
+        log.warning("Img2img fallback to txt2img for job %s: %s", record.job_id, exc)
+        return None
 
-    # ── post-processing (optional, all opt-in) ────────────────────────────────
-    record.phase = "post_processing"
-    record.progress_step = num_steps
-    t_post = time.perf_counter()
-    result_img = _apply_post_processing(result_img, req, effective_pp, palette_colors, palette_ctx["profile"])
-    timing["post_processing_s"] = round(time.perf_counter() - t_post, 4)
-    effective_pixelate = bool(effective_pp.get("pixelate", False) or req.auto_pipeline)
-    effective_quantize = bool(effective_pp.get("quantize_palette", False) or (
-        req.auto_pipeline and bool(palette_colors)
-    ))
-    effective_cleanup = bool(effective_pp.get("pixel_cleanup", False) or req.auto_pipeline)
-    log.info(
-        "Job %s post-processing applied | auto=%s pixelate=%s remove_bg=%s quantize=%s cleanup=%s",
-        record.job_id,
-        req.auto_pipeline,
-        effective_pixelate,
-        bool(effective_pp.get("remove_background", False)),
-        effective_quantize,
-        effective_cleanup,
+
+def _run_txt2img_inference(
+    record: JobRecord,
+    req: GenerateRequest,
+    pipe: Any,
+    effective_control_mode: str,
+    control_image: PIL.Image.Image | None,
+    gen_w: int,
+    gen_h: int,
+    num_steps: int,
+    full_prompt: str,
+    generator: Any,
+    timing: dict[str, Any],
+    on_step: Any,
+) -> PIL.Image.Image:
+    t_txt2img = time.perf_counter()
+    log.info("Job %s starting txt2img inference", record.job_id)
+    # Auto-inject iso anti-drift negatives when in iso lane.
+    # Prevents SDXL from slipping to front-view / top-down / perspective shots.
+    iso_negative = (
+        "front view, side view, top-down, flat overhead, bird's eye, "
+        "aerial view, straight-on, perspective distortion, first person, "
+        "3/4 front view, close-up, no depth, flat projection"
     )
+    effective_negative = req.negative_prompt or ""
+    if req.lane == "iso" and iso_negative not in effective_negative:
+        effective_negative = (iso_negative + ", " + effective_negative).strip(", ")
+    txt2img_kwargs = {
+        "prompt": full_prompt,
+        "negative_prompt": effective_negative or None,
+        "width": gen_w,
+        "height": gen_h,
+        "num_inference_steps": num_steps,
+        "guidance_scale": req.cfg_scale,
+        "generator": generator,
+    }
+    if effective_control_mode != "none" and control_image is not None:
+        txt2img_kwargs["image"] = control_image
+        txt2img_kwargs["controlnet_conditioning_scale"] = req.control_strength
+        txt2img_kwargs["control_guidance_start"] = req.control_start
+        txt2img_kwargs["control_guidance_end"] = req.control_end
+    txt2img_kwargs = _with_progress_callbacks(pipe.__call__, txt2img_kwargs, on_step)
+    result_img = pipe(**txt2img_kwargs).images[0]
+    timing["inference_s"] = round(time.perf_counter() - t_txt2img, 4)
+    timing["inference_mode"] = "txt2img"
+    log.info("Job %s txt2img finished in %.2fs", record.job_id, timing["inference_s"])
+    return result_img
 
-    # ── save/serialize outputs ───────────────────────────────────────────────
-    record.phase = "saving_outputs"
-    t_save = time.perf_counter()
+
+def _run_inference(
+    record: JobRecord,
+    req: GenerateRequest,
+    pipe: Any,
+    init_image: PIL.Image.Image | None,
+    effective_control_mode: str,
+    control_image: PIL.Image.Image | None,
+    gen_w: int,
+    gen_h: int,
+    num_steps: int,
+    full_prompt: str,
+    generator: Any,
+    torch_module: Any,
+    timing: dict[str, Any],
+    on_step: Any,
+) -> PIL.Image.Image:
+    # Try img2img only when a source image is provided; on compatibility errors,
+    # fallback to txt2img so the job still succeeds and returns real outputs.
+    result_img: PIL.Image.Image | None = None
+    if init_image is not None and req.control_mode == "none":
+        result_img = _run_img2img_inference(
+            record,
+            req,
+            pipe,
+            init_image,
+            gen_w,
+            gen_h,
+            num_steps,
+            full_prompt,
+            generator,
+            torch_module,
+            timing,
+            on_step,
+        )
+
+    if result_img is None:
+        result_img = _run_txt2img_inference(
+            record,
+            req,
+            pipe,
+            effective_control_mode,
+            control_image,
+            gen_w,
+            gen_h,
+            num_steps,
+            full_prompt,
+            generator,
+            timing,
+            on_step,
+        )
+    return result_img
+
+
+def _build_output_frames_and_sheet(
+    result_img: PIL.Image.Image,
+    req: GenerateRequest,
+    palette_colors: list[str],
+    gen_w: int,
+    gen_h: int,
+) -> tuple[PIL.Image.Image, PIL.Image.Image, list[PIL.Image.Image], list[dict[str, Any]]]:
+    from PIL import Image
+
     frame_scores: list[dict[str, Any]] = []
     if req.keyframe_first and (req.sheet.columns * req.sheet.rows) > 1:
-        from PIL import Image
-
         keyframe = result_img.convert("RGBA").resize(
             (req.sheet.frame_width, req.sheet.frame_height),
             Image.Resampling.NEAREST,
@@ -3616,19 +3646,91 @@ def _run_generation(record: JobRecord) -> None:
             req.sheet.padding,
         )
         # Keep output preview dimensions stable while using keyframe-first sequence.
-        result_img = keyframe.resize((gen_w, gen_h), Image.Resampling.NEAREST)
-    else:
-        sheet_img, frames = _build_spritesheet(
-            result_img,
-            req.sheet.frame_width,
-            req.sheet.frame_height,
-            req.sheet.columns,
-            req.sheet.rows,
-            req.sheet.padding,
-        )
-    frame_urls: list[str] = []
+        preview_img = keyframe.resize((gen_w, gen_h), Image.Resampling.NEAREST)
+        return preview_img, sheet_img, frames, frame_scores
 
-    metadata = {
+    sheet_img, frames = _build_spritesheet(
+        result_img,
+        req.sheet.frame_width,
+        req.sheet.frame_height,
+        req.sheet.columns,
+        req.sheet.rows,
+        req.sheet.padding,
+    )
+    return result_img, sheet_img, frames, frame_scores
+
+
+def _persist_render_outputs(
+    req: GenerateRequest,
+    job_id: str,
+    png_image: PIL.Image.Image,
+    gif_image: PIL.Image.Image,
+    sheet_img: PIL.Image.Image,
+    frames: list[PIL.Image.Image],
+) -> tuple[str, str, str, str, list[str], str]:
+    frame_urls: list[str] = []
+    if req.ephemeral_output:
+        png_url = _image_to_data_url(png_image, "PNG", "image/png")
+        webp_url = _image_to_data_url(png_image, "WEBP", "image/webp", lossless=True)
+        gif_url = _image_to_data_url(gif_image, "GIF", "image/gif", save_all=False)
+        spritesheet_png_url = _image_to_data_url(sheet_img, "PNG", "image/png")
+        frame_urls = [_image_to_data_url(frame, "PNG", "image/png") for frame in frames]
+        return png_url, webp_url, gif_url, spritesheet_png_url, frame_urls, ""
+
+    job_dir = _OUTPUT_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
+
+    png_path = job_dir / "output.png"
+    png_image.save(str(png_path), format="PNG")
+
+    webp_path = job_dir / "output.webp"
+    png_image.save(str(webp_path), format="WEBP", lossless=True)
+
+    gif_path = job_dir / "output.gif"
+    gif_image.save(str(gif_path), format="GIF", save_all=False)
+
+    spritesheet_path = job_dir / "output_sheet.png"
+    sheet_img.save(str(spritesheet_path), format="PNG")
+
+    frames_dir = job_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    for i, frame in enumerate(frames):
+        frame_name = f"frame_{i:03d}.png"
+        frame_path = frames_dir / frame_name
+        frame.save(str(frame_path), format="PNG")
+        frame_urls.append(f"/outputs/{job_id}/frames/{frame_name}")
+
+    base = f"/outputs/{job_id}"
+    png_url = f"{base}/output.png"
+    webp_url = f"{base}/output.webp"
+    gif_url = f"{base}/output.gif"
+    spritesheet_png_url = f"{base}/output_sheet.png"
+    metadata_url = f"{base}/metadata.json"
+    return png_url, webp_url, gif_url, spritesheet_png_url, frame_urls, metadata_url
+
+
+def _build_generation_metadata(
+    record: JobRecord,
+    req: GenerateRequest,
+    full_prompt: str,
+    actual_seed: int,
+    palette_ctx: dict[str, Any],
+    palette_name: str,
+    palette_colors: list[str],
+    preset_ctx: dict[str, Any],
+    dna_ctx: dict[str, Any] | None,
+    frame_scores: list[dict[str, Any]],
+    effective_pp: dict[str, Any],
+    control_metadata: dict[str, Any] | None,
+    gen_w: int,
+    gen_h: int,
+    frames: list[PIL.Image.Image],
+    gen_scale: int,
+    gen_w_raw: int,
+    gen_h_raw: int,
+    source_analysis: SourceAnalysis | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "job_id": record.job_id,
         "lane": req.lane,
         "output_mode": req.output_mode,
@@ -3693,64 +3795,53 @@ def _run_generation(record: JobRecord) -> None:
     }
     if source_analysis is not None:
         metadata["source_analysis"] = source_analysis.model_dump()
-    png_image = result_img.convert("RGBA")
-    gif_image = result_img.convert("RGB").convert("P", palette=Image.Palette.ADAPTIVE)
+    return metadata
 
-    if req.ephemeral_output:
-        png_url = _image_to_data_url(png_image, "PNG", "image/png")
-        webp_url = _image_to_data_url(png_image, "WEBP", "image/webp", lossless=True)
-        gif_url = _image_to_data_url(gif_image, "GIF", "image/gif", save_all=False)
-        spritesheet_png_url = _image_to_data_url(sheet_img, "PNG", "image/png")
-        frame_urls = [_image_to_data_url(frame, "PNG", "image/png") for frame in frames]
-        metadata_url = ""
-    else:
-        job_dir = _OUTPUT_DIR / record.job_id
-        job_dir.mkdir(exist_ok=True)
 
-        png_path = job_dir / "output.png"
-        png_image.save(str(png_path), format="PNG")
-
-        webp_path = job_dir / "output.webp"
-        png_image.save(str(webp_path), format="WEBP", lossless=True)
-
-        gif_path = job_dir / "output.gif"
-        gif_image.save(str(gif_path), format="GIF", save_all=False)
-
-        spritesheet_path = job_dir / "output_sheet.png"
-        sheet_img.save(str(spritesheet_path), format="PNG")
-
-        frames_dir = job_dir / "frames"
-        frames_dir.mkdir(exist_ok=True)
-        for i, frame in enumerate(frames):
-            frame_name = f"frame_{i:03d}.png"
-            frame_path = frames_dir / frame_name
-            frame.save(str(frame_path), format="PNG")
-            frame_urls.append(f"/outputs/{record.job_id}/frames/{frame_name}")
-
-        base = f"/outputs/{record.job_id}"
-        png_url = f"{base}/output.png"
-        webp_url = f"{base}/output.webp"
-        gif_url = f"{base}/output.gif"
-        spritesheet_png_url = f"{base}/output_sheet.png"
-        metadata_url = f"{base}/metadata.json"
-
+def _finalize_generation_timing_and_metadata(
+    req: GenerateRequest,
+    job_id: str,
+    metadata: dict[str, Any],
+    timing: dict[str, Any],
+    t_save: float,
+    t_job: float,
+    execution_device: str,
+    torch_module: Any,
+) -> str:
     timing["save_outputs_s"] = round(time.perf_counter() - t_save, 4)
     timing["total_s"] = round(time.perf_counter() - t_job, 4)
     if execution_device == "cuda":
         try:
-            timing["cuda_peak_allocated_mb"] = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 2)
-            timing["cuda_peak_reserved_mb"] = round(torch.cuda.max_memory_reserved() / (1024 * 1024), 2)
+            timing["cuda_peak_allocated_mb"] = round(torch_module.cuda.max_memory_allocated() / (1024 * 1024), 2)
+            timing["cuda_peak_reserved_mb"] = round(torch_module.cuda.max_memory_reserved() / (1024 * 1024), 2)
         except Exception:
             timing["cuda_peak_allocated_mb"] = None
             timing["cuda_peak_reserved_mb"] = None
     metadata["timing"] = timing
     if req.ephemeral_output:
-        metadata_url = _to_data_url(json.dumps(metadata, indent=2).encode("utf-8"), "application/json")
-    else:
-        meta_path = (_OUTPUT_DIR / record.job_id) / "metadata.json"
-        meta_path.write_text(json.dumps(metadata, indent=2))
-        log.info("Job %s files saved in %.2fs", record.job_id, timing["save_outputs_s"])
+        return _to_data_url(json.dumps(metadata, indent=2).encode("utf-8"), "application/json")
 
+    meta_path = (_OUTPUT_DIR / job_id) / "metadata.json"
+    meta_path.write_text(json.dumps(metadata, indent=2))
+    log.info("Job %s files saved in %.2fs", job_id, timing["save_outputs_s"])
+    return f"/outputs/{job_id}/metadata.json"
+
+
+def _finalize_success_record(
+    record: JobRecord,
+    req: GenerateRequest,
+    num_steps: int,
+    actual_seed: int,
+    full_prompt: str,
+    png_url: str,
+    webp_url: str,
+    gif_url: str,
+    spritesheet_png_url: str,
+    frame_urls: list[str],
+    metadata_url: str,
+    metadata: dict[str, Any],
+    timing: dict[str, Any],
+) -> None:
     image_url_by_format = {
         "png": png_url,
         "webp": webp_url,
@@ -3777,7 +3868,350 @@ def _run_generation(record: JobRecord) -> None:
         "metadata": metadata,
     }
     _record_generation_metrics(record.job_id, req, timing)
-    log.info("Job %s complete in %.2fs", record.job_id, timing["total_s"])
+    _log_event(
+        logging.INFO,
+        "job_complete",
+        job_id=record.job_id,
+        status=record.status,
+        total_s=timing["total_s"],
+        inference_s=timing["inference_s"],
+        pipeline_load_s=timing["pipeline_load_s"],
+        save_outputs_s=timing["save_outputs_s"],
+        seed=actual_seed,
+        inference_mode=timing["inference_mode"],
+        cuda_peak_allocated_mb=timing["cuda_peak_allocated_mb"],
+        cuda_peak_reserved_mb=timing["cuda_peak_reserved_mb"],
+    )
+
+
+def _apply_and_log_post_processing(
+    record: JobRecord,
+    req: GenerateRequest,
+    result_img: PIL.Image.Image,
+    effective_pp: dict[str, Any],
+    palette_colors: list[str],
+    palette_profile: dict[str, Any],
+    timing: dict[str, Any],
+    num_steps: int,
+) -> PIL.Image.Image:
+    record.phase = "post_processing"
+    record.progress_step = num_steps
+    t_post = time.perf_counter()
+    processed = _apply_post_processing(result_img, req, effective_pp, palette_colors, palette_profile)
+    timing["post_processing_s"] = round(time.perf_counter() - t_post, 4)
+
+    effective_pixelate = bool(effective_pp.get("pixelate", False) or req.auto_pipeline)
+    effective_quantize = bool(effective_pp.get("quantize_palette", False) or (req.auto_pipeline and bool(palette_colors)))
+    effective_cleanup = bool(effective_pp.get("pixel_cleanup", False) or req.auto_pipeline)
+    log.info(
+        "Job %s post-processing applied | auto=%s pixelate=%s remove_bg=%s quantize=%s cleanup=%s",
+        record.job_id,
+        req.auto_pipeline,
+        effective_pixelate,
+        bool(effective_pp.get("remove_background", False)),
+        effective_quantize,
+        effective_cleanup,
+    )
+    return processed
+
+
+def _new_generation_timing() -> dict[str, Any]:
+    return {
+        "source_decode_s": 0.0,
+        "source_processing_s": 0.0,
+        "pipeline_load_s": 0.0,
+        "inference_s": 0.0,
+        "inference_mode": "txt2img",
+        "post_processing_s": 0.0,
+        "save_outputs_s": 0.0,
+        "total_s": 0.0,
+        "cuda_peak_allocated_mb": None,
+        "cuda_peak_reserved_mb": None,
+    }
+
+
+def _initialize_generation_run(record: JobRecord, req: GenerateRequest, torch_module: Any) -> tuple[float, dict[str, Any], str]:
+    record.phase = "preparing"
+    record.progress_step = None
+    record.progress_total = None
+    t_job = time.perf_counter()
+    timing = _new_generation_timing()
+
+    _log_event(
+        logging.INFO,
+        "job_start",
+        job_id=record.job_id,
+        model=req.model_family,
+        lane=req.lane,
+        output_mode=req.output_mode,
+        output_format=req.output_format,
+        ephemeral=req.ephemeral_output,
+    )
+    if req.ephemeral_output:
+        log.info("Job %s running with ephemeral output mode (no disk persistence)", record.job_id)
+    else:
+        job_dir = _OUTPUT_DIR / record.job_id
+        job_dir.mkdir(exist_ok=True)
+        log.info("Job %s output dir: %s", record.job_id, job_dir)
+
+    execution_device = _resolve_execution_device(torch_module)
+    if execution_device != "cuda":
+        log.warning(
+            "Job %s running in CPU fallback mode (PIXEL_EXECUTION_DEVICE=%s)",
+            record.job_id,
+            os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
+        )
+    return t_job, timing, execution_device
+
+
+def _prepare_seeded_generator(
+    torch_module: Any,
+    execution_device: str,
+    requested_seed: int,
+    job_id: str,
+) -> tuple[Any, int]:
+    # With CPU offload enabled, pipe.device can be "meta". Generator must target
+    # a real execution device, not the internal placeholder device.
+    generator = torch_module.Generator(device=execution_device)
+    if execution_device == "cuda":
+        try:
+            torch_module.cuda.reset_peak_memory_stats()
+        except Exception:
+            # Keep generation resilient if memory stats are unavailable.
+            pass
+
+    # seed=-1 means random; any other value is used directly for reproducibility
+    actual_seed = requested_seed if requested_seed >= 0 else int.from_bytes(os.urandom(4), "little")
+    generator.manual_seed(actual_seed)
+    log.info("Job %s seed=%d (requested=%d)", job_id, actual_seed, requested_seed)
+    return generator, actual_seed
+
+
+def _prepare_generation_context(
+    req: GenerateRequest,
+    job_id: str,
+) -> tuple[
+    dict[str, Any],
+    list[str],
+    str,
+    dict[str, Any],
+    dict[str, Any] | None,
+    dict[str, Any],
+    str,
+]:
+    palette_ctx = _resolve_palette_context(req.palette)
+    palette_colors: list[str] = palette_ctx["colors"]
+    palette_name: str = str(palette_ctx["label"])
+    preset_ctx = _resolve_asset_preset_context(req)
+    dna_ctx = _resolve_character_dna_context(req.character_dna_id)
+    effective_pp = _resolve_effective_post_processing(req, preset_ctx)
+    full_prompt = _build_full_prompt(req, preset_ctx, dna_ctx, palette_colors, palette_name)
+    log.info(
+        "Job %s prompt prepared | prompt_len=%d neg_len=%d palette_colors=%d",
+        job_id,
+        len(req.prompt),
+        len(req.negative_prompt),
+        len(palette_colors),
+    )
+    return palette_ctx, palette_colors, palette_name, preset_ctx, dna_ctx, effective_pp, full_prompt
+
+
+@dataclass
+class _GenerationSetup:
+    effective_control_mode: str
+    init_image: PIL.Image.Image | None
+    source_analysis: SourceAnalysis | None
+    pipe: Any
+    defaults: dict[str, int]
+    gen_w: int
+    gen_h: int
+    gen_scale: int
+    min_gen_size: int
+    gen_w_raw: int
+    gen_h_raw: int
+    control_image: PIL.Image.Image | None
+    control_metadata: dict[str, Any] | None
+
+
+def _prepare_pipeline_and_size_context(
+    req: GenerateRequest,
+    job_id: str,
+    timing: dict[str, Any],
+) -> _GenerationSetup:
+    # ── source image for img2img (optional, with safe fallback) ───────────────
+    effective_control_mode = _resolve_effective_control_mode(req)
+    init_image, source_analysis = _decode_and_process_source_image(req, job_id, timing)
+
+    t_pipe = time.perf_counter()
+    pipe = _load_pipeline(req.model_family, effective_control_mode)
+    timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
+
+    # ── determine output size ─────────────────────────────────────────────────
+    defaults = _resolve_profile_defaults()
+    gen_w, gen_h, gen_scale, min_gen_size, gen_w_raw, gen_h_raw = _resolve_generation_dimensions(req, defaults)
+    log.info(
+        "Job %s target size: %dx%d (frame=%dx%d, scale=%dx, min_gen=%d)",
+        job_id,
+        gen_w,
+        gen_h,
+        req.sheet.frame_width,
+        req.sheet.frame_height,
+        gen_scale,
+        min_gen_size,
+    )
+
+    control_image, control_metadata = _prepare_control_guide(
+        req,
+        init_image,
+        effective_control_mode,
+        gen_w,
+        gen_h,
+        job_id,
+    )
+    return _GenerationSetup(
+        effective_control_mode=effective_control_mode,
+        init_image=init_image,
+        source_analysis=source_analysis,
+        pipe=pipe,
+        defaults=defaults,
+        gen_w=gen_w,
+        gen_h=gen_h,
+        gen_scale=gen_scale,
+        min_gen_size=min_gen_size,
+        gen_w_raw=gen_w_raw,
+        gen_h_raw=gen_h_raw,
+        control_image=control_image,
+        control_metadata=control_metadata,
+    )
+
+
+def _run_generation(record: JobRecord) -> None:
+    """Execute SDXL generation and produce either persisted files or ephemeral data URLs."""
+    import torch
+    from PIL import Image
+
+    req = record.request
+    t_job, timing, execution_device = _initialize_generation_run(record, req, torch)
+
+    (
+        palette_ctx,
+        palette_colors,
+        palette_name,
+        preset_ctx,
+        dna_ctx,
+        effective_pp,
+        full_prompt,
+    ) = _prepare_generation_context(req, record.job_id)
+    setup = _prepare_pipeline_and_size_context(req, record.job_id, timing)
+
+    generator, actual_seed = _prepare_seeded_generator(torch, execution_device, req.seed, record.job_id)
+
+    num_steps = _resolve_num_steps(setup.defaults)
+    record.progress_total = num_steps
+    record.progress_step = 0
+
+    def _log_step(step: int) -> None:
+        record.phase = "inference"
+        record.progress_step = min(num_steps, max(0, step + 1))
+        if step == 0 or (step + 1) % 5 == 0 or (step + 1) == num_steps:
+            log.info("Job %s progress: step %d/%d", record.job_id, step + 1, num_steps)
+
+    result_img = _run_inference(
+        record,
+        req,
+        setup.pipe,
+        setup.init_image,
+        setup.effective_control_mode,
+        setup.control_image,
+        setup.gen_w,
+        setup.gen_h,
+        num_steps,
+        full_prompt,
+        generator,
+        torch,
+        timing,
+        _log_step,
+    )
+
+    # ── post-processing (optional, all opt-in) ────────────────────────────────
+    result_img = _apply_and_log_post_processing(
+        record,
+        req,
+        result_img,
+        effective_pp,
+        palette_colors,
+        cast(dict[str, Any], palette_ctx["profile"]),
+        timing,
+        num_steps,
+    )
+
+    # ── save/serialize outputs ───────────────────────────────────────────────
+    record.phase = "saving_outputs"
+    t_save = time.perf_counter()
+    result_img, sheet_img, frames, frame_scores = _build_output_frames_and_sheet(
+        result_img,
+        req,
+        palette_colors,
+        setup.gen_w,
+        setup.gen_h,
+    )
+
+    metadata = _build_generation_metadata(
+        record,
+        req,
+        full_prompt,
+        actual_seed,
+        palette_ctx,
+        palette_name,
+        palette_colors,
+        preset_ctx,
+        dna_ctx,
+        frame_scores,
+        effective_pp,
+        setup.control_metadata,
+        setup.gen_w,
+        setup.gen_h,
+        frames,
+        setup.gen_scale,
+        setup.gen_w_raw,
+        setup.gen_h_raw,
+        setup.source_analysis,
+    )
+    png_image = result_img.convert("RGBA")
+    gif_image = result_img.convert("RGB").convert("P", palette=Image.Palette.ADAPTIVE)
+    png_url, webp_url, gif_url, spritesheet_png_url, frame_urls, metadata_url = _persist_render_outputs(
+        req,
+        record.job_id,
+        png_image,
+        gif_image,
+        sheet_img,
+        frames,
+    )
+    metadata_url = _finalize_generation_timing_and_metadata(
+        req,
+        record.job_id,
+        metadata,
+        timing,
+        t_save,
+        t_job,
+        execution_device,
+        torch,
+    )
+    _finalize_success_record(
+        record,
+        req,
+        num_steps,
+        actual_seed,
+        full_prompt,
+        png_url,
+        webp_url,
+        gif_url,
+        spritesheet_png_url,
+        frame_urls,
+        metadata_url,
+        metadata,
+        timing,
+    )
 
 
 def _get_installed_version(package_name: str) -> str | None:
@@ -4064,6 +4498,14 @@ def _run_job(record: JobRecord) -> None:
             record.error = None
             log.info("Job %s marked cancelled after generation return", record.job_id)
     except Exception as exc:
+        _log_event(
+            logging.ERROR,
+            "job_failed",
+            job_id=record.job_id,
+            phase=record.phase,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
         record.phase = "failed"
@@ -4127,11 +4569,39 @@ def create_app() -> FastAPI:
             request.method.upper() == "OPTIONS"
             and bool(request.headers.get("access-control-request-method"))
         )
+        request_id = uuid.uuid4().hex[:12]
+        t_request = time.perf_counter()
 
-        if is_preflight and origin_allowed:
-            response = Response(status_code=204)
-        else:
-            response = await call_next(request)
+        if request.url.path not in _HTTP_LOG_SUPPRESSED_PATHS:
+            _log_event(
+                logging.INFO,
+                "http_request_start",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                query=request.url.query,
+                preflight=is_preflight,
+            )
+
+        try:
+            if is_preflight and origin_allowed:
+                response = Response(status_code=204)
+            else:
+                response = await call_next(request)
+        except Exception as exc:
+            _log_event(
+                logging.ERROR,
+                "http_request_error",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                duration_ms=round((time.perf_counter() - t_request) * 1000, 2),
+            )
+            raise
+
+        response.headers["X-Request-ID"] = request_id
 
         if origin_allowed:
             response.headers["Access-Control-Allow-Origin"] = origin or ""
@@ -4139,6 +4609,17 @@ def create_app() -> FastAPI:
             response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
             requested_headers = request.headers.get("access-control-request-headers")
             response.headers["Access-Control-Allow-Headers"] = requested_headers or "*"
+
+        if request.url.path not in _HTTP_LOG_SUPPRESSED_PATHS:
+            _log_event(
+                logging.INFO,
+                "http_request_done",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                duration_ms=round((time.perf_counter() - t_request) * 1000, 2),
+            )
 
         return response
 
