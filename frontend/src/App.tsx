@@ -60,6 +60,8 @@ const STARTER_PROMPTS_BY_OUTPUT_MODE: Record<string, string> = {
     "Pixel Art prop sheet, top-down game props, consistent scale, clean outlines, limited palette, transparent background, no text, no UI, no watermark.",
   tile_chunk:
     "Pixel Art grass tile, seamless, top-down view, subtle texture, dark green base with light green highlights, tiny wildflowers and small pebbles, 16-bit style, tileable edges, no vignette, no text.",
+  tile_iso:
+    "Pixel Art isometric tile, 2:1 dimetric projection, seam-safe edges, readable material steps, controlled depth shading, no characters, no text.",
   ui_module:
     "Pixel Art UI module, RPG-style panel and buttons, crisp borders, high contrast readability, transparent background, clean icon slots, no text labels, no watermark.",
 };
@@ -67,6 +69,8 @@ const STARTER_PROMPTS_BY_OUTPUT_MODE: Record<string, string> = {
 const STARTER_PROMPTS_BY_LANE: Record<string, string> = {
   sprite:
     "Pixel Art character sprite, game-ready, 3/4 view, readable silhouette, limited palette, crisp edges, transparent background, no text, no UI.",
+  iso:
+    "Pixel Art isometric character asset, 2:1 dimetric projection, readable three-face volume, clean silhouette, controlled depth shading, transparent background, no text, no UI.",
   world:
     "Pixel Art environment tile, seamless, top-down view, repeat-safe edges, subtle texture variation, balanced contrast, 16-bit style, no vignette, no text.",
   prop:
@@ -99,6 +103,8 @@ type QuickStartPreset = {
 const QUICK_START_PRESETS: QuickStartPreset[] = [
   { label: "Character Sprite", lane: "sprite", outputMode: "single_sprite", outputFormat: "png" },
   { label: "Animation Sheet", lane: "sprite", outputMode: "sprite_sheet", outputFormat: "spritesheet_png" },
+  { label: "Iso Sprite", lane: "iso", outputMode: "single_sprite", outputFormat: "png" },
+  { label: "Iso Tile", lane: "iso", outputMode: "tile_iso", outputFormat: "png" },
   { label: "Tile Chunk", lane: "world", outputMode: "tile_chunk", outputFormat: "png" },
   { label: "UI Module", lane: "ui", outputMode: "ui_module", outputFormat: "png" },
 ];
@@ -117,7 +123,9 @@ const DEFAULT_MODELS: ModelOption[] = [
 
 const DEFAULT_ASSET_PRESETS: AssetPreset[] = [
   { id: "sprite", label: "Sprite" },
+  { id: "iso_sprite", label: "Iso Sprite (2.5D)" },
   { id: "tile", label: "Tile" },
+  { id: "iso_tile", label: "Iso Tile (2.5D)" },
   { id: "prop", label: "Prop" },
   { id: "effect", label: "VFX / Effect" },
   { id: "ui", label: "UI" },
@@ -212,6 +220,10 @@ type StudioSettings = {
   reframeAnchorX: string;
   reframeAnchorY: string;
   motionSpaceHint: string;
+  controlMode: string;
+  controlStrength: number;
+  controlStart: number;
+  controlEnd: number;
   seed: number;
   cfgScale: number;
   enhancePrompt: boolean;
@@ -468,6 +480,7 @@ function App() {
   const [theme, setTheme] = useState<Theme>(savedSettings.theme ?? (prefersDark ? "dark" : "light"));
 
   const [models, setModels] = useState<ModelOption[]>(DEFAULT_MODELS);
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>(false);
   const [palettes, setPalettes] = useState<PalettePreset[]>(DEFAULT_PALETTES);
   const [assetPresets, setAssetPresets] = useState<AssetPreset[]>(DEFAULT_ASSET_PRESETS);
   const [formats, setFormats] = useState<ExportFormat[]>(DEFAULT_FORMATS);
@@ -557,6 +570,10 @@ function App() {
   const [motionSpaceHint, setMotionSpaceHint] = useState<string>(
     savedSettings.motionSpaceHint ?? "auto",
   );
+  const [controlMode, setControlMode] = useState<string>(savedSettings.controlMode ?? "none");
+  const [controlStrength, setControlStrength] = useState<number>(savedSettings.controlStrength ?? 0.5);
+  const [controlStart, setControlStart] = useState<number>(savedSettings.controlStart ?? 0);
+  const [controlEnd, setControlEnd] = useState<number>(savedSettings.controlEnd ?? 1);
 
   const [editorGrid, setEditorGrid] = useState<number>(savedSettings.editorGrid ?? 24);
   const [editorColor, setEditorColor] = useState<string>(savedSettings.editorColor ?? "#78b0a6");
@@ -577,7 +594,8 @@ function App() {
   const { state: jobState, submit: submitJob, cancel: cancelJob } = useJobPoller(handleJobUpdate);
   const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
 
-  const availableModels = models.length > 0 ? models : DEFAULT_MODELS;
+  const availableModels = modelsLoaded ? models : DEFAULT_MODELS;
+  const hasAvailableModels = availableModels.length > 0;
   const availablePalettes = palettes.length > 0 ? palettes : DEFAULT_PALETTES;
   const availableAssetPresets = assetPresets.length > 0 ? assetPresets : DEFAULT_ASSET_PRESETS;
   const availableFormats = formats.length > 0 ? formats : DEFAULT_FORMATS;
@@ -762,6 +780,10 @@ function App() {
       reframeAnchorX,
       reframeAnchorY,
       motionSpaceHint,
+      controlMode,
+      controlStrength,
+      controlStart,
+      controlEnd,
       seed,
       cfgScale,
       enhancePrompt,
@@ -821,6 +843,10 @@ function App() {
     reframeAnchorX,
     reframeAnchorY,
     motionSpaceHint,
+    controlMode,
+    controlStrength,
+    controlStart,
+    controlEnd,
     seed,
     cfgScale,
     enhancePrompt,
@@ -894,18 +920,35 @@ function App() {
       fetchExportFormats(),
     ])
       .then(([m, p, ap, f]) => {
-        setModels(m.length ? m : DEFAULT_MODELS);
+        setModels(m);
+        setModelsLoaded(true);
         setPalettes(p.length ? p : DEFAULT_PALETTES);
         setAssetPresets(ap.length ? ap : DEFAULT_ASSET_PRESETS);
         setFormats(f.length ? f : DEFAULT_FORMATS);
       })
       .catch(() => {
         setModels(DEFAULT_MODELS);
+        setModelsLoaded(false);
         setPalettes(DEFAULT_PALETTES);
         setAssetPresets(DEFAULT_ASSET_PRESETS);
         setFormats(DEFAULT_FORMATS);
       });
   }, []);
+
+  useEffect(() => {
+    if (!modelsLoaded) {
+      return;
+    }
+    if (models.length === 0) {
+      if (modelFamily !== "") {
+        setModelFamily("");
+      }
+      return;
+    }
+    if (!models.some((model) => model.id === modelFamily)) {
+      setModelFamily(models[0]?.id ?? "");
+    }
+  }, [modelFamily, models, modelsLoaded]);
 
   useEffect(() => {
     if (!availablePalettes.some((palette) => palette.id === palettePreset)) {
@@ -1048,6 +1091,13 @@ function App() {
   async function handleSubmitJob() {
     setValidationError("");
 
+    if (!hasAvailableModels) {
+      setValidationError(
+        "No runnable models are currently available. Replace the broken checkpoint or add a healthy Diffusers model directory first.",
+      );
+      return;
+    }
+
     if (!prompt.trim()) {
       setValidationError("Prompt is required.");
       return;
@@ -1089,6 +1139,10 @@ function App() {
         anchor_y: reframeAnchorY,
         preserve_bounds: true,
       },
+      control_mode: controlMode,
+      control_strength: controlStrength,
+      control_start: controlStart,
+      control_end: controlEnd,
       tile_options: {
         tile_size: tileSize,
         seamless_mode: tileSeamless,
@@ -1417,6 +1471,7 @@ function App() {
                 <input value="Pixel Art Diffusion XL SpriteShaper ★ Recommended" readOnly />
               ) : (
                 <select value={modelFamily} onChange={(e) => setModelFamily(e.target.value)}>
+                  {!hasAvailableModels && <option value="">No runnable models available</option>}
                   {availableModels.map((model) => (
                     <option key={model.id} value={model.id}>
                       {model.label}
@@ -1428,7 +1483,9 @@ function App() {
             <p className="muted">
               {lockModelSelection
                 ? "Public mode keeps one stable model path to reduce failures and keep output consistency."
-                : "Choose one profile/checkpoint per run; profiles are not combined automatically."}
+                : hasAvailableModels
+                  ? "Choose one profile/checkpoint per run; profiles are not combined automatically."
+                  : "No runnable backend models are available right now. Repair the local checkpoint or provide a healthy Diffusers model directory."}
             </p>
 
             <label>
@@ -1474,6 +1531,7 @@ function App() {
                 Lane
                 <select value={lane} onChange={(e) => setLane(e.target.value)}>
                   <option value="sprite">Sprite</option>
+                  <option value="iso">Iso</option>
                   <option value="world">World</option>
                   <option value="prop">Prop</option>
                   <option value="ui">UI</option>
@@ -1488,6 +1546,7 @@ function App() {
                   <option value="sprite_sheet">Sprite Sheet</option>
                   <option value="prop_sheet">Prop Sheet</option>
                   <option value="tile_chunk">Tile Chunk</option>
+                  <option value="tile_iso">Iso Tile</option>
                   <option value="ui_module">UI Module</option>
                 </select>
               </label>
@@ -1505,7 +1564,7 @@ function App() {
             </div>
 
             <div className="submit-dock" role="region" aria-label="Primary action">
-              <button className="submit submit-primary" onClick={handleSubmitJob}>
+              <button className="submit submit-primary" onClick={handleSubmitJob} disabled={!hasAvailableModels}>
                 Submit Generation
               </button>
               <p className="muted">Core settings above. Advanced settings can be expanded below when needed.</p>
@@ -1796,6 +1855,53 @@ function App() {
                     <option value="open">Open (e.g., full-screen camera)</option>
                   </select>
                 </label>
+
+                <label className="label">
+                  <span className="label-text">ControlNet Mode</span>
+                  <select value={controlMode} onChange={(e) => setControlMode(e.target.value)}>
+                    <option value="none">None</option>
+                    <option value="depth">Depth</option>
+                    <option value="canny">Canny Edges</option>
+                  </select>
+                </label>
+
+                {controlMode !== "none" && (
+                  <div className="nested-controls">
+                    <label className="label">
+                      <span className="label-text">Control Strength: {controlStrength.toFixed(2)}</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1.5"
+                        step="0.05"
+                        value={controlStrength}
+                        onChange={(e) => setControlStrength(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="label">
+                      <span className="label-text">Control Start: {controlStart.toFixed(2)}</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={controlStart}
+                        onChange={(e) => setControlStart(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="label">
+                      <span className="label-text">Control End: {controlEnd.toFixed(2)}</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={controlEnd}
+                        onChange={(e) => setControlEnd(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
             )}
 

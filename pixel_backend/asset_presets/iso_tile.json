@@ -1,0 +1,20 @@
+{
+  "id": "iso_tile",
+  "label": "Iso Tile",
+  "prompt_tags": [
+    "isometric tile",
+    "2:1 dimetric projection",
+    "seam-safe edges",
+    "material readability"
+  ],
+  "post_processing": {
+    "pixel_cleanup": true,
+    "outline_strength": 1,
+    "anti_alias_level": 1,
+    "cluster_smoothing": 2,
+    "contrast_boost": 1,
+    "shadow_reinforcement": 1,
+    "highlight_reinforcement": 1,
+    "palette_strictness": 1
+  }
+}

@@ -93,12 +93,16 @@ def test_models_contract() -> None:
     payload = response.json()
     assert "models" in payload
     assert isinstance(payload["models"], list)
+    assert "unavailable_models" in payload
+    assert isinstance(payload["unavailable_models"], list)
 
     model_ids = {item["id"] for item in payload["models"]}
-    assert "sdxl_base" in model_ids
-    assert "pixel_art_diffusion_xl" in model_ids
-    assert "sdxl_pixel_art" in model_ids
-    assert "sdxl_pixel_art_xl" in model_ids
+    unavailable_ids = {item["id"] for item in payload["unavailable_models"]}
+    all_ids = model_ids | unavailable_ids
+    assert "sdxl_base" in all_ids
+    assert "pixel_art_diffusion_xl" in all_ids
+    assert "sdxl_pixel_art" in all_ids
+    assert "sdxl_pixel_art_xl" in all_ids
 
 
 def test_palettes_contract() -> None:
@@ -135,7 +139,7 @@ def test_asset_presets_contract() -> None:
     assert "presets" in payload
     assert isinstance(payload["presets"], list)
     preset_ids = {item["id"] for item in payload["presets"]}
-    assert {"sprite", "tile", "prop", "effect", "ui"}.issubset(preset_ids)
+    assert {"sprite", "tile", "prop", "effect", "ui", "iso_sprite", "iso_tile"}.issubset(preset_ids)
 
 
 def test_character_dna_contract() -> None:
@@ -228,6 +232,71 @@ def test_generate_rejects_invalid_output_mode() -> None:
     assert response.status_code == 400
     payload = response.json()
     assert "output_mode must be one of" in payload["detail"]
+
+
+def test_generate_rejects_invalid_control_mode() -> None:
+    response = client.post(
+        "/api/pixel/jobs/generate",
+        json={
+            "prompt": "test",
+            "output_format": "png",
+            "model_family": "sdxl_base",
+            "control_mode": "scribble",
+        },
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert "control_mode must be one of" in payload["detail"]
+
+
+def test_generate_rejects_control_mode_without_source_image() -> None:
+    response = client.post(
+        "/api/pixel/jobs/generate",
+        json={
+            "prompt": "test",
+            "output_format": "png",
+            "model_family": "sdxl_base",
+            "control_mode": "depth",
+            "source_image_base64": None,
+        },
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["detail"] == "control_mode requires source_image_base64"
+
+
+def test_generate_rejects_invalid_control_guidance_window() -> None:
+    response = client.post(
+        "/api/pixel/jobs/generate",
+        json={
+            "prompt": "test",
+            "output_format": "png",
+            "model_family": "sdxl_base",
+            "control_mode": "none",
+            "control_start": 0.9,
+            "control_end": 0.2,
+        },
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["detail"] == "control_end must be greater than or equal to control_start"
+
+
+def test_generate_accepts_iso_lane_and_output_aliases() -> None:
+    response = client.post(
+        "/api/pixel/jobs/generate",
+        json={
+            "prompt": "test",
+            "output_format": "png",
+            "model_family": "sdxl_base",
+            "lane": "iso",
+            "output_mode": "tile_iso",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert "job_id" in payload
+    assert payload["status"] in {"queued", "pending", "failure"}
 
 
 def test_generate_rejects_invalid_motion_prior() -> None:

@@ -12,6 +12,7 @@ import math
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +36,7 @@ _LOGGING_CONFIGURED = False
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _MODELS_DIR = _REPO_ROOT / "models"
 _DIFFUSERS_MODELS_DIR = _MODELS_DIR / "Diffusers"
+_CONTROLNET_MODELS_DIR = _MODELS_DIR / "ControlNet"
 _OUTPUT_DIR = _REPO_ROOT / "pixel_output"
 _PALETTES_DIR = _REPO_ROOT / "pixel_backend" / "palettes"
 _ASSET_PRESETS_DIR = _REPO_ROOT / "pixel_backend" / "asset_presets"
@@ -71,6 +73,7 @@ _BASE_MODEL_CHECKPOINTS: dict[str, str] = {
 _ALLOWED_OUTPUT_FORMATS = {"png", "webp", "gif", "spritesheet_png"}
 _ALLOWED_LANES = {
     "sprite",
+    "iso",
     "world",
     "prop",
     "ui",
@@ -81,19 +84,27 @@ _ALLOWED_LANES = {
 }
 _ALLOWED_OUTPUT_MODES = {
     "sprite",
+    "single_sprite",
     "spritesheet",
     "sprite_sheet",
     "prop_sheet",
     "tile_chunk",
+    "tile_iso",
     "ui_module",
 }
 _HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # ── lazy pipeline cache ────────────────────────────────────────────────────────
 _PIPELINE_CACHE: dict[str, Any] = {}
+_CONTROLNET_CACHE: dict[str, Any] = {}
+_CHECKPOINT_PROBE_CACHE: dict[str, dict[str, Any]] = {}
+_SINGLE_FILE_LOAD_PROBE_CACHE: dict[str, dict[str, Any]] = {}
+_DIFFUSERS_LOAD_PROBE_CACHE: dict[str, dict[str, Any]] = {}
+_RUNTIME_RESOURCE_LIMITS_CACHE: dict[str, Any] = {}
 _PALETTE_CACHE: dict[str, dict[str, Any]] | None = None
 _ASSET_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
 _CHARACTER_DNA_CACHE: dict[str, dict[str, Any]] | None = None
+_DEPTH_GUIDE_COMPONENTS: tuple[Any, Any] | None = None
 
 # ── generation worker queue (single GPU-safe worker by default) ───────────────
 _JOB_QUEUE: deque[str] = deque()
@@ -116,9 +127,30 @@ def _resolve_startup_preload_model_family() -> str | None:
 
 
 def _preload_pipeline_on_startup() -> None:
-    if not _env_flag("PIXEL_PRELOAD_ON_STARTUP", default=True):
+    if not _env_flag("PIXEL_PRELOAD_ON_STARTUP", default=False):
         log.info("Startup preload disabled via PIXEL_PRELOAD_ON_STARTUP")
         return
+
+    try:
+        import torch
+
+        requested_model_source = _resolve_model_source()
+        has_diffusers_dir = _resolve_diffusers_model_dir(
+            "pixel_art_diffusion_xl",
+            _CHECKPOINT,
+            None,
+        ) is not None
+        effective_model_source = "diffusers" if requested_model_source == "diffusers" or (
+            requested_model_source == "auto" and has_diffusers_dir
+        ) else "single_file"
+        if _resolve_execution_device(torch) == "cuda":
+            log.warning(
+                "Startup preload skipped for CUDA pipeline (source=%s) to avoid unstable warm-up; lazy load will happen on first job",
+                effective_model_source,
+            )
+            return
+    except Exception:
+        log.exception("Startup preload safety check failed; continuing with preload decision")
 
     model_family = _resolve_startup_preload_model_family()
     if not model_family:
@@ -179,11 +211,142 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_int_env(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except Exception:
+        log.warning("Invalid %s=%s; using default=%d", name, raw, default)
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _resolve_float_env(name: str, default: float, min_value: float, max_value: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except Exception:
+        log.warning("Invalid %s=%s; using default=%.2f", name, raw, default)
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _apply_process_priority() -> str:
+    requested = os.getenv("PIXEL_PROCESS_PRIORITY", "below_normal").strip().lower()
+    if requested in {"", "normal"}:
+        return "normal"
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            classes = {
+                "idle": 0x00000040,
+                "below_normal": 0x00004000,
+                "above_normal": 0x00008000,
+                "high": 0x00000080,
+            }
+            priority_class = classes.get(requested)
+            if priority_class is None:
+                log.warning("Unknown PIXEL_PROCESS_PRIORITY=%s; using below_normal", requested)
+                priority_class = classes["below_normal"]
+                requested = "below_normal"
+
+            kernel32 = ctypes.windll.kernel32
+            if not kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), priority_class):
+                raise OSError("SetPriorityClass failed")
+            return requested
+        except Exception as exc:
+            log.warning("Failed to apply Windows process priority (%s)", exc)
+            return "normal"
+
+    # POSIX fallback via niceness (best effort).
+    try:
+        if requested == "idle":
+            os.nice(10)
+            return "idle"
+        if requested == "below_normal":
+            os.nice(5)
+            return "below_normal"
+    except Exception as exc:
+        log.warning("Failed to apply process niceness (%s)", exc)
+    return "normal"
+
+
+def _apply_runtime_resource_limits() -> dict[str, Any]:
+    global _RUNTIME_RESOURCE_LIMITS_CACHE
+
+    cpu_count = os.cpu_count() or 4
+    cpu_reserved_cores = _resolve_int_env("PIXEL_CPU_RESERVED_CORES", 2, 0, max(0, cpu_count - 1))
+    cpu_threads_default = max(1, min(8, max(1, cpu_count - cpu_reserved_cores)))
+    interop_default = max(1, min(4, max(1, cpu_threads_default // 2)))
+
+    cpu_threads = _resolve_int_env("PIXEL_CPU_THREADS", cpu_threads_default, 1, max(1, cpu_count))
+    cpu_interop_threads = _resolve_int_env("PIXEL_CPU_INTEROP_THREADS", interop_default, 1, max(1, cpu_count))
+    requested_cuda_memory_fraction = _resolve_float_env("PIXEL_CUDA_MEMORY_FRACTION", 0.72, 0.2, 0.95)
+    cuda_reserved_vram_mb = _resolve_int_env("PIXEL_CUDA_RESERVED_VRAM_MB", 2048, 256, 24576)
+    cuda_memory_fraction = requested_cuda_memory_fraction
+    process_priority = _apply_process_priority()
+    resource_profile = _resolve_resource_profile()
+
+    applied: dict[str, Any] = {
+        "cpu_count": cpu_count,
+        "cpu_reserved_cores": cpu_reserved_cores,
+        "cpu_threads": cpu_threads,
+        "cpu_interop_threads": cpu_interop_threads,
+        "cuda_memory_fraction_requested": requested_cuda_memory_fraction,
+        "cuda_reserved_vram_mb": cuda_reserved_vram_mb,
+        "cuda_memory_fraction": cuda_memory_fraction,
+        "process_priority": process_priority,
+        "resource_profile": resource_profile,
+    }
+
+    try:
+        import torch
+
+        torch.set_num_threads(cpu_threads)
+        try:
+            torch.set_num_interop_threads(cpu_interop_threads)
+        except RuntimeError:
+            # Can only be configured once in a process.
+            pass
+
+        execution_device = _resolve_execution_device(torch)
+        if execution_device == "cuda" and torch.cuda.is_available():
+            try:
+                total_vram_mb = int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+                budget_fraction = max(
+                    0.2,
+                    min(0.95, (total_vram_mb - cuda_reserved_vram_mb) / float(max(1, total_vram_mb))),
+                )
+                cuda_memory_fraction = min(requested_cuda_memory_fraction, budget_fraction)
+                torch.cuda.set_per_process_memory_fraction(cuda_memory_fraction, device=0)
+                applied["cuda_total_vram_mb"] = total_vram_mb
+                applied["cuda_budget_fraction"] = round(budget_fraction, 4)
+                applied["cuda_memory_fraction"] = round(cuda_memory_fraction, 4)
+                applied["cuda_memory_fraction_applied"] = True
+            except Exception as exc:
+                applied["cuda_memory_fraction_applied"] = False
+                applied["cuda_memory_fraction_error"] = str(exc)
+    except Exception as exc:
+        applied["torch_limit_error"] = str(exc)
+
+    _RUNTIME_RESOURCE_LIMITS_CACHE = applied
+    log.info(
+        "Runtime limits applied: priority=%s cpu_threads=%s interop=%s cuda_mem_fraction=%.2f",
+        process_priority,
+        cpu_threads,
+        cpu_interop_threads,
+        cuda_memory_fraction,
+    )
+    return applied
+
+
 def _resolve_execution_device(torch_module: Any) -> str:
     """Resolve execution device with optional env override.
 
     PIXEL_EXECUTION_DEVICE values:
-    - auto (default): use CUDA when available
+    - auto (default): use CUDA when available, otherwise CPU
     - cuda: force CUDA, falls back to CPU if unavailable
     - cpu: force CPU (stability mode)
     """
@@ -257,9 +420,9 @@ def _resolve_disable_mmap() -> bool:
     - 1/true/yes/on: disable mmap
     - 0/false/no/off: allow mmap
 
-    Default: False.
+    Default: True on Windows, False elsewhere.
     """
-    return _env_flag("PIXEL_DISABLE_MMAP", default=False)
+    return _env_flag("PIXEL_DISABLE_MMAP", default=os.name == "nt")
 
 
 def _resolve_model_source() -> str:
@@ -278,6 +441,14 @@ def _resolve_model_source() -> str:
     return "auto"
 
 
+def _resolve_resource_profile() -> str:
+    requested = os.getenv("PIXEL_RESOURCE_PROFILE", "daily").strip().lower()
+    if requested in {"daily", "balanced", "max"}:
+        return requested
+    log.warning("Unknown PIXEL_RESOURCE_PROFILE=%s; using daily", requested)
+    return "daily"
+
+
 def _looks_like_diffusers_model_dir(path: pathlib.Path) -> bool:
     if not path.is_dir():
         return False
@@ -292,13 +463,21 @@ def _looks_like_diffusers_model_dir(path: pathlib.Path) -> bool:
 
     # Only treat as ready when core weights are present.
     # This avoids auto-selecting partially downloaded Diffusers directories.
-    has_unet_weights = (
-        (path / "unet" / "diffusion_pytorch_model.bin").exists()
-        or (path / "unet" / "diffusion_pytorch_model.safetensors").exists()
+    has_unet_weights = any(
+        (path / "unet" / candidate).exists()
+        for candidate in (
+            "diffusion_pytorch_model.bin",
+            "diffusion_pytorch_model.safetensors",
+            "diffusion_pytorch_model.fp16.safetensors",
+        )
     )
-    has_vae_weights = (
-        (path / "vae" / "diffusion_pytorch_model.bin").exists()
-        or (path / "vae" / "diffusion_pytorch_model.safetensors").exists()
+    has_vae_weights = any(
+        (path / "vae" / candidate).exists()
+        for candidate in (
+            "diffusion_pytorch_model.bin",
+            "diffusion_pytorch_model.safetensors",
+            "diffusion_pytorch_model.fp16.safetensors",
+        )
     )
     return has_unet_weights and has_vae_weights
 
@@ -313,6 +492,7 @@ def _candidate_diffusers_dir_names(model_family: str, checkpoint_path: pathlib.P
 
     add(model_family)
     add(checkpoint_path.stem)
+    add("sdxl_base")
 
     if lora_file:
         add("pixel_art_diffusion_xl")
@@ -477,6 +657,14 @@ class GenerateRequest(BaseModel):
     """Retries per frame when consistency score is below threshold."""
     motion_prior: str = "auto"
     """Motion prior for frame derivation: auto|bloom|pulse|sway|rotate|bounce|flicker|dissolve."""
+    control_mode: str = "none"
+    """Optional structural control: none|depth|canny. Requires source_image_base64."""
+    control_strength: float = Field(default=0.5, ge=0.0, le=2.0)
+    """ControlNet conditioning scale."""
+    control_start: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Fraction of denoising timeline where control begins."""
+    control_end: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Fraction of denoising timeline where control ends."""
 
 
 class JobResponse(BaseModel):
@@ -899,6 +1087,15 @@ def _validate_generate_request(request: GenerateRequest) -> None:
         allowed = ", ".join(sorted(_ALLOWED_OUTPUT_MODES))
         raise HTTPException(status_code=400, detail=f"output_mode must be one of: {allowed}")
 
+    allowed_control_modes = {"none", "depth", "canny"}
+    if request.control_mode not in allowed_control_modes:
+        allowed = ", ".join(sorted(allowed_control_modes))
+        raise HTTPException(status_code=400, detail=f"control_mode must be one of: {allowed}")
+    if request.control_mode != "none" and not request.source_image_base64:
+        raise HTTPException(status_code=400, detail="control_mode requires source_image_base64")
+    if request.control_end < request.control_start:
+        raise HTTPException(status_code=400, detail="control_end must be greater than or equal to control_start")
+
     if not (2 <= request.palette.size <= 256):
         raise HTTPException(status_code=400, detail="palette.size must be between 2 and 256")
 
@@ -1089,6 +1286,20 @@ def _default_asset_preset_catalog() -> dict[str, dict[str, Any]]:
                 "contrast_boost": 1,
             },
         },
+        "iso_sprite": {
+            "id": "iso_sprite",
+            "label": "Iso Sprite",
+            "prompt_tags": ["isometric sprite", "2:1 dimetric projection", "readable volume"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 2,
+                "anti_alias_level": 2,
+                "cluster_smoothing": 1,
+                "contrast_boost": 1,
+                "shadow_reinforcement": 2,
+                "highlight_reinforcement": 1,
+            },
+        },
         "tile": {
             "id": "tile",
             "label": "Tile",
@@ -1099,6 +1310,20 @@ def _default_asset_preset_catalog() -> dict[str, dict[str, Any]]:
                 "anti_alias_level": 1,
                 "cluster_smoothing": 2,
                 "contrast_boost": 0,
+            },
+        },
+        "iso_tile": {
+            "id": "iso_tile",
+            "label": "Iso Tile",
+            "prompt_tags": ["isometric tile", "2:1 dimetric projection", "seam-safe edge rhythm"],
+            "post_processing": {
+                "pixel_cleanup": True,
+                "outline_strength": 1,
+                "anti_alias_level": 1,
+                "cluster_smoothing": 2,
+                "contrast_boost": 1,
+                "shadow_reinforcement": 1,
+                "highlight_reinforcement": 1,
             },
         },
         "prop": {
@@ -1227,6 +1452,7 @@ def _resolve_asset_preset_context(req: GenerateRequest) -> dict[str, Any]:
     if requested == "auto" or requested == "":
         lane_to_preset = {
             "sprite": "sprite",
+            "iso": "iso_sprite",
             "world": "tile",
             "prop": "prop",
             "ui": "ui",
@@ -1291,14 +1517,367 @@ def _resolve_model_spec(model_family: str) -> tuple[pathlib.Path, str | None]:
     return checkpoint_path, lora_file
 
 
+def _probe_single_file_checkpoint(checkpoint_path: pathlib.Path) -> dict[str, Any]:
+    try:
+        stat = checkpoint_path.stat()
+    except Exception as exc:
+        return {"healthy": False, "message": f"checkpoint stat failed: {exc}"}
+
+    cache_key = f"{checkpoint_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}"
+    cached = _CHECKPOINT_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe_code = (
+        "import sys\n"
+        "from safetensors import safe_open\n"
+        "checkpoint_path = sys.argv[1]\n"
+        "with safe_open(checkpoint_path, framework='np') as handle:\n"
+        "    key = next(iter(handle.keys()))\n"
+        "    tensor = handle.get_tensor(key)\n"
+        "    print(f'{key}|{tuple(tensor.shape)}|{tensor.dtype}')\n"
+    )
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, str(checkpoint_path)],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result = {"healthy": False, "message": "checkpoint probe timed out after 90 seconds"}
+        _CHECKPOINT_PROBE_CACHE[cache_key] = result
+        return result
+    except Exception as exc:
+        result = {"healthy": False, "message": f"checkpoint probe failed to start: {exc}"}
+        _CHECKPOINT_PROBE_CACHE[cache_key] = result
+        return result
+
+    if completed.returncode == 0:
+        result = {
+            "healthy": True,
+            "message": completed.stdout.strip() or "checkpoint probe passed",
+        }
+        _CHECKPOINT_PROBE_CACHE[cache_key] = result
+        return result
+
+    stderr = completed.stderr.strip()
+    stdout = completed.stdout.strip()
+    detail = stderr or stdout or f"checkpoint probe exited with code {completed.returncode}"
+    result = {"healthy": False, "message": detail}
+    _CHECKPOINT_PROBE_CACHE[cache_key] = result
+    return result
+
+
+def _probe_single_file_loader(checkpoint_path: pathlib.Path, disable_mmap: bool) -> dict[str, Any]:
+    try:
+        stat = checkpoint_path.stat()
+    except Exception as exc:
+        return {"healthy": False, "message": f"checkpoint stat failed: {exc}"}
+
+    cache_key = f"{checkpoint_path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}::mmap={int(disable_mmap)}"
+    cached = _SINGLE_FILE_LOAD_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe_code = (
+        "import json\n"
+        "import sys\n"
+        "from diffusers.loaders.single_file_utils import load_single_file_checkpoint\n"
+        "checkpoint = load_single_file_checkpoint(sys.argv[1], disable_mmap=sys.argv[2] == '1')\n"
+        "print(json.dumps({'tensor_count': len(checkpoint)}))\n"
+    )
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, str(checkpoint_path), "1" if disable_mmap else "0"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result = {"healthy": False, "message": "single-file loader probe timed out after 180 seconds"}
+        _SINGLE_FILE_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+    except Exception as exc:
+        result = {"healthy": False, "message": f"single-file loader probe failed to start: {exc}"}
+        _SINGLE_FILE_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+
+    if completed.returncode == 0:
+        result = {"healthy": True, "message": completed.stdout.strip() or "single-file loader probe passed"}
+        _SINGLE_FILE_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+
+    stderr = completed.stderr.strip()
+    stdout = completed.stdout.strip()
+    detail = stderr or stdout or f"single-file loader probe exited with code {completed.returncode}"
+    result = {"healthy": False, "message": detail}
+    _SINGLE_FILE_LOAD_PROBE_CACHE[cache_key] = result
+    return result
+
+
+def _probe_diffusers_loader(diffusers_dir: pathlib.Path, dtype_name: str) -> dict[str, Any]:
+    probe_targets = [
+        diffusers_dir / "model_index.json",
+        diffusers_dir / "unet" / "config.json",
+        diffusers_dir / "vae" / "config.json",
+        diffusers_dir / "text_encoder_2" / "config.json",
+    ]
+    for target in probe_targets:
+        if not target.exists():
+            return {"healthy": False, "message": f"missing Diffusers file: {target}"}
+
+    try:
+        stats = [target.stat() for target in probe_targets]
+    except Exception as exc:
+        return {"healthy": False, "message": f"diffusers stat failed: {exc}"}
+
+    has_fp16_unet = (diffusers_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors").exists()
+    cache_key = (
+        f"{diffusers_dir.resolve()}::{dtype_name}::fp16={int(has_fp16_unet)}::"
+        + "::".join(f"{s.st_size}:{s.st_mtime_ns}" for s in stats)
+    )
+    cached = _DIFFUSERS_LOAD_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    probe_code = (
+        "import json\n"
+        "import sys\n"
+        "import torch\n"
+        "from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import StableDiffusionXLPipeline\n"
+        "model_dir = sys.argv[1]\n"
+        "dtype_name = sys.argv[2]\n"
+        "use_fp16_variant = sys.argv[3] == '1'\n"
+        "dtype = torch.float16 if dtype_name == 'float16' else torch.float32\n"
+        "kwargs = {'variant': 'fp16'} if use_fp16_variant else {}\n"
+        "pipe = StableDiffusionXLPipeline.from_pretrained(model_dir, torch_dtype=dtype, use_safetensors=True, local_files_only=True, **kwargs)\n"
+        "print(json.dumps({'component_count': len(pipe.components)}))\n"
+    )
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                probe_code,
+                str(diffusers_dir),
+                dtype_name,
+                "1" if has_fp16_unet else "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result = {"healthy": False, "message": "diffusers loader probe timed out after 300 seconds"}
+        _DIFFUSERS_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+    except Exception as exc:
+        result = {"healthy": False, "message": f"diffusers loader probe failed to start: {exc}"}
+        _DIFFUSERS_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+
+    if completed.returncode == 0:
+        result = {"healthy": True, "message": completed.stdout.strip() or "diffusers loader probe passed"}
+        _DIFFUSERS_LOAD_PROBE_CACHE[cache_key] = result
+        return result
+
+    stderr = completed.stderr.strip()
+    stdout = completed.stdout.strip()
+    detail = stderr or stdout or f"diffusers loader probe exited with code {completed.returncode}"
+    result = {"healthy": False, "message": detail}
+    _DIFFUSERS_LOAD_PROBE_CACHE[cache_key] = result
+    return result
+
+
+def _ensure_single_file_checkpoint_healthy(checkpoint_path: pathlib.Path, model_family: str) -> None:
+    probe = _probe_single_file_checkpoint(checkpoint_path)
+    if probe.get("healthy"):
+        return
+    message = cast(str, probe.get("message") or "checkpoint probe failed")
+    raise ValueError(
+        f"Checkpoint for model_family={model_family} failed the single-file probe: {message}"
+    )
+
+
+def _get_model_family_availability(model_family: str) -> dict[str, Any]:
+    try:
+        checkpoint_path, lora_file = _resolve_model_spec(model_family)
+    except ValueError as exc:
+        return {"available": False, "reason": str(exc), "source": "unknown"}
+
+    requested_model_source = _resolve_model_source()
+    diffusers_dir = _resolve_diffusers_model_dir(model_family, checkpoint_path, lora_file)
+    effective_model_source = "diffusers" if requested_model_source == "diffusers" or (
+        requested_model_source == "auto" and diffusers_dir is not None
+    ) else "single_file"
+
+    if effective_model_source == "diffusers":
+        if diffusers_dir is not None:
+            dtype_name = "float32"
+            try:
+                import torch
+
+                execution_device = _resolve_execution_device(torch)
+                dtype = _resolve_pipeline_load_dtype(torch, execution_device)
+                dtype_name = "float16" if dtype == torch.float16 else "float32"
+            except Exception:
+                pass
+
+            diffusers_probe = _probe_diffusers_loader(diffusers_dir, dtype_name)
+            if not diffusers_probe.get("healthy"):
+                return {
+                    "available": False,
+                    "reason": cast(str, diffusers_probe.get("message") or "diffusers loader probe failed"),
+                    "source": "diffusers",
+                    "checkpoint": checkpoint_path.name,
+                    "diffusers_dir": str(diffusers_dir),
+                }
+            return {
+                "available": True,
+                "source": "diffusers",
+                "checkpoint": checkpoint_path.name,
+                "diffusers_dir": str(diffusers_dir),
+            }
+        return {
+            "available": False,
+            "reason": f"No local Diffusers directory found for model_family={model_family}",
+            "source": "diffusers",
+            "checkpoint": checkpoint_path.name,
+        }
+
+    checkpoint_probe = _probe_single_file_checkpoint(checkpoint_path)
+    if not checkpoint_probe.get("healthy"):
+        return {
+            "available": False,
+            "reason": cast(str, checkpoint_probe.get("message") or "checkpoint probe failed"),
+            "source": "single_file",
+            "checkpoint": checkpoint_path.name,
+        }
+
+    loader_probe = _probe_single_file_loader(checkpoint_path, _resolve_disable_mmap())
+    if not loader_probe.get("healthy"):
+        return {
+            "available": False,
+            "reason": cast(str, loader_probe.get("message") or "single-file loader probe failed"),
+            "source": "single_file",
+            "checkpoint": checkpoint_path.name,
+        }
+
+    probe = checkpoint_probe
+    if probe.get("healthy"):
+        return {
+            "available": True,
+            "source": "single_file",
+            "checkpoint": checkpoint_path.name,
+        }
+    return {
+        "available": False,
+        "reason": cast(str, probe.get("message") or "checkpoint probe failed"),
+        "source": "single_file",
+        "checkpoint": checkpoint_path.name,
+    }
+
+
+def _is_model_family_available(model_family: str) -> bool:
+    return bool(_get_model_family_availability(model_family).get("available"))
+
+
+def _build_model_catalog() -> dict[str, list[dict[str, str]]]:
+    managed_models: list[dict[str, str]] = [
+        {
+            "id": "sdxl_base",
+            "label": "PAD-XL SpriteShaper (active base)",
+            "quality": "pixel-checkpoint",
+        },
+        {
+            "id": "pixel_art_diffusion_xl",
+            "label": "Pixel Art Diffusion XL SpriteShaper ★",
+            "quality": "pixel-checkpoint",
+        },
+        {
+            "id": "sdxl_pixel_art",
+            "label": "SDXL Base + 64×64 Pixel Art LoRA",
+            "quality": "pixel-optimized",
+        },
+        {
+            "id": "sdxl_pixel_art_xl",
+            "label": "SDXL Base + Pixel Art XL v1.1 LoRA",
+            "quality": "pixel-optimized",
+        },
+        {
+            "id": "sdxl_swordsman",
+            "label": "SDXL + Swordsman LoRA",
+            "quality": "character-optimized",
+        },
+        {
+            "id": "sdxl_jinja_shrine",
+            "label": "SDXL + Jinja Shrine Zen LoRA",
+            "quality": "environment-optimized",
+        },
+    ]
+
+    available_models: list[dict[str, str]] = []
+    unavailable_models: list[dict[str, str]] = []
+    for model in managed_models:
+        availability = _get_model_family_availability(model["id"])
+        if availability.get("available"):
+            available_models.append(model)
+            continue
+        unavailable_models.append(
+            {
+                **model,
+                "source": cast(str, availability.get("source") or "unknown"),
+                "reason": cast(str, availability.get("reason") or "Unavailable"),
+                "checkpoint": cast(str, availability.get("checkpoint") or ""),
+            }
+        )
+
+    _known_checkpoints = set(_BASE_MODEL_CHECKPOINTS.values())
+    for checkpoint in _list_local_checkpoints():
+        dynamic_id = f"checkpoint:{checkpoint.name}"
+        if checkpoint.name in _known_checkpoints:
+            continue
+        model = {
+            "id": dynamic_id,
+            "label": f"Checkpoint: {checkpoint.stem}",
+            "quality": "local-checkpoint",
+        }
+        availability = _get_model_family_availability(dynamic_id)
+        if availability.get("available"):
+            available_models.append(model)
+            continue
+        unavailable_models.append(
+            {
+                **model,
+                "source": cast(str, availability.get("source") or "unknown"),
+                "reason": cast(str, availability.get("reason") or "Unavailable"),
+                "checkpoint": cast(str, availability.get("checkpoint") or checkpoint.name),
+            }
+        )
+
+    return {"models": available_models, "unavailable_models": unavailable_models}
+
+
 def _load_pipeline_from_diffusers_dir(
     pipeline_cls: Any,
     diffusers_dir: pathlib.Path,
     dtype: Any,
     model_family: str,
     checkpoint_path: pathlib.Path,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
     t0 = time.perf_counter()
+    load_kwargs = dict(extra_kwargs or {})
+    if dtype is not None and getattr(dtype, "__repr__", lambda: "")() == "torch.float16":
+        if (diffusers_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors").exists():
+            load_kwargs.setdefault("variant", "fp16")
     log.info(
         "Loading SDXL pipeline from Diffusers directory (model_family=%s, source=%s, fallback_checkpoint=%s)",
         model_family,
@@ -1309,6 +1888,8 @@ def _load_pipeline_from_diffusers_dir(
         str(diffusers_dir),
         torch_dtype=dtype,
         use_safetensors=True,
+        local_files_only=True,
+        **load_kwargs,
     )
     log.info("Diffusers pipeline loaded in %.2fs", time.perf_counter() - t0)
     return pipe
@@ -1323,7 +1904,9 @@ def _load_pipeline_from_single_file(
     device: str,
     model_family: str,
     torch_module: Any,
+    extra_kwargs: dict[str, Any] | None = None,
 ) -> Any:
+    _ensure_single_file_checkpoint_healthy(checkpoint_path, model_family)
     t0 = time.perf_counter()
     log.info(
         "Loading SDXL checkpoint onto %s (model_family=%s, checkpoint=%s, dtype=%s, safetensors=%s, disable_mmap=%s)",
@@ -1340,15 +1923,149 @@ def _load_pipeline_from_single_file(
         torch_dtype=dtype,
         use_safetensors=use_safetensors,
         disable_mmap=disable_mmap,
+        **(extra_kwargs or {}),
     )
     _log_gpu_stage(torch_module, "after_from_single_file")
     log.info("Checkpoint loaded in %.2fs", time.perf_counter() - t0)
     return pipe
 
 
-def _load_pipeline(model_family: str) -> Any:
+def _resolve_controlnet_path(control_mode: str) -> pathlib.Path:
+    mapping = {
+        "depth": _CONTROLNET_MODELS_DIR / "controlnet-depth-sdxl-1.0",
+        "canny": _CONTROLNET_MODELS_DIR / "controlnet-canny-sdxl-1.0",
+    }
+    path = mapping.get(control_mode)
+    if path is None:
+        raise ValueError(f"Unsupported control mode: {control_mode}")
+    return path
+
+
+def _load_controlnet_model(control_mode: str) -> Any | None:
+    if control_mode == "none":
+        return None
+
+    import torch
+    from diffusers.models.controlnets.controlnet import ControlNetModel
+
+    path = _resolve_controlnet_path(control_mode)
+    if not path.exists():
+        raise ValueError(
+            f"ControlNet weights for mode '{control_mode}' were not found at {path}. "
+            "Download the local ControlNet artifacts first."
+        )
+
+    if control_mode in _CONTROLNET_CACHE:
+        return _CONTROLNET_CACHE[control_mode]
+
+    if _CONTROLNET_CACHE:
+        _CONTROLNET_CACHE.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    device = _resolve_execution_device(torch)
+    dtype = _resolve_pipeline_load_dtype(torch, device)
+    t0 = time.perf_counter()
+    model = ControlNetModel.from_pretrained(
+        str(path),
+        torch_dtype=dtype,
+        use_safetensors=True,
+        local_files_only=True,
+    )
+    log.info("ControlNet loaded in %.2fs (mode=%s)", time.perf_counter() - t0, control_mode)
+    _CONTROLNET_CACHE[control_mode] = model
+    return model
+
+
+def _get_depth_guide_components() -> tuple[Any, Any]:
+    global _DEPTH_GUIDE_COMPONENTS
+    if _DEPTH_GUIDE_COMPONENTS is not None:
+        return _DEPTH_GUIDE_COMPONENTS
+
+    from transformers import DPTFeatureExtractor, DPTForDepthEstimation
+
+    feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-hybrid-midas")
+    depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas")
+    depth_estimator.eval()
+    _DEPTH_GUIDE_COMPONENTS = (feature_extractor, depth_estimator)
+    return _DEPTH_GUIDE_COMPONENTS
+
+
+def _build_control_image(
+    source_image: PIL.Image.Image,
+    control_mode: str,
+    width: int,
+    height: int,
+) -> tuple[PIL.Image.Image, dict[str, Any]]:
+    from PIL import Image, ImageFilter
+
+    resized = source_image.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
+
+    if control_mode == "canny":
+        try:
+            import numpy as np
+            cv2 = cast(Any, __import__("cv2"))
+
+            arr = np.array(resized)
+            edges = cv2.Canny(arr, 100, 200)
+            edge_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+            return Image.fromarray(edge_rgb), {
+                "mode": control_mode,
+                "guide_size": {"width": width, "height": height},
+                "preprocess": "opencv_canny",
+            }
+        except Exception:
+            import numpy as np
+
+            edge_img = resized.filter(ImageFilter.FIND_EDGES).convert("L")
+            edge_arr = np.array(edge_img, dtype=np.uint8)
+            thresholded = (edge_arr >= 32).astype(np.uint8) * 255
+            return Image.fromarray(thresholded, mode="L").convert("RGB"), {
+                "mode": control_mode,
+                "guide_size": {"width": width, "height": height},
+                "preprocess": "pil_find_edges_fallback",
+            }
+
+    if control_mode == "depth":
+        import numpy as np
+        import torch
+
+        feature_extractor, depth_estimator = _get_depth_guide_components()
+        pixel_values = feature_extractor(images=resized, return_tensors="pt").pixel_values
+        with torch.no_grad():
+            depth_map = depth_estimator(pixel_values).predicted_depth
+
+        depth_map = torch.nn.functional.interpolate(
+            depth_map.unsqueeze(1),
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_map = (depth_map - depth_min) / torch.clamp(depth_max - depth_min, min=1e-6)
+        depth_rgb = torch.cat([depth_map] * 3, dim=1).permute(0, 2, 3, 1).cpu().numpy()[0]
+        depth_img = Image.fromarray((depth_rgb * 255.0).clip(0, 255).astype(np.uint8))
+        return depth_img, {
+            "mode": control_mode,
+            "guide_size": {"width": width, "height": height},
+            "preprocess": "dpt_hybrid_midas",
+        }
+
+    return resized, {
+        "mode": "none",
+        "guide_size": {"width": width, "height": height},
+        "preprocess": "none",
+    }
+
+
+def _load_pipeline(model_family: str, control_mode: str = "none") -> Any:
     """Load (and cache) an SDXL pipeline for the requested model family."""
     import torch
+    from diffusers.pipelines.controlnet.pipeline_controlnet_sd_xl import (
+        StableDiffusionXLControlNetPipeline,
+    )
     from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import (
         StableDiffusionXLPipeline,
     )
@@ -1370,7 +2087,7 @@ def _load_pipeline(model_family: str) -> Any:
         selected_model_source = "diffusers" if diffusers_dir is not None else "single_file"
 
     source_ref = diffusers_dir if selected_model_source == "diffusers" else checkpoint_path
-    cache_key = f"{selected_model_source}:{source_ref}|{lora_file or ''}"
+    cache_key = f"{selected_model_source}:{source_ref}|{lora_file or ''}|control={control_mode}"
     if cache_key in _PIPELINE_CACHE:
         log.info(
             "Pipeline cache hit for model_family=%s source=%s ref=%s",
@@ -1419,6 +2136,25 @@ def _load_pipeline(model_family: str) -> Any:
             model_family,
             torch,
         )
+    if lora_file:
+        lora_path = _MODELS_DIR / "Lora" / lora_file
+        if lora_path.exists():
+            t_lora = time.perf_counter()
+            try:
+                log.info("Loading/fusing LoRA: %s", lora_file)
+                pipe.load_lora_weights(str(lora_path.parent), weight_name=lora_file)
+                pipe.fuse_lora(lora_scale=0.8)
+                log.info("LoRA ready in %.2fs", time.perf_counter() - t_lora)
+            except Exception as exc:
+                log.warning("LoRA load failed (%s). Continuing with base checkpoint only.", exc)
+        else:
+            log.warning("LoRA file not found: %s", lora_path)
+
+    if control_mode != "none":
+        controlnet = cast(Any, _load_controlnet_model(control_mode))
+        t_control = time.perf_counter()
+        pipe = StableDiffusionXLControlNetPipeline(controlnet=controlnet, **pipe.components)
+        log.info("ControlNet pipeline assembled in %.2fs (mode=%s)", time.perf_counter() - t_control, control_mode)
     if device == "cuda":
         # Prefer sequential offload on 12GB cards: slower, but significantly lower peak VRAM.
         # Do NOT call pipe.to("cuda") before offload; hooks manage placement automatically.
@@ -1453,20 +2189,6 @@ def _load_pipeline(model_family: str) -> Any:
     _log_gpu_stage(torch, "after_vae_setup")
     pipe.set_progress_bar_config(disable=False)
     log.info("Pipeline ready (model_family=%s, source=%s)", model_family, selected_model_source)
-
-    if lora_file:
-        lora_path = _MODELS_DIR / "Lora" / lora_file
-        if lora_path.exists():
-            t_lora = time.perf_counter()
-            try:
-                log.info("Loading/fusing LoRA: %s", lora_file)
-                pipe.load_lora_weights(str(lora_path.parent), weight_name=lora_file)
-                pipe.fuse_lora(lora_scale=0.8)
-                log.info("LoRA ready in %.2fs", time.perf_counter() - t_lora)
-            except Exception as exc:
-                log.warning("LoRA load failed (%s). Continuing with base checkpoint only.", exc)
-        else:
-            log.warning("LoRA file not found: %s", lora_path)
 
     _PIPELINE_CACHE[cache_key] = pipe
     return pipe
@@ -1833,7 +2555,7 @@ def _apply_post_processing(
         if cluster_smoothing > 0:
             max_neighbors_same = max(0, 2 - cluster_smoothing)
             img = _remove_isolated_pixels(img, max_neighbors_same=max_neighbors_same)
-        if req.lane == "sprite" and outline_strength > 0:
+        if req.lane in {"sprite", "iso"} and outline_strength > 0:
             img = _strengthen_outline(
                 img,
                 outline_strength=outline_strength,
@@ -1851,7 +2573,7 @@ def _apply_post_processing(
             img = _quantize_to_palette(img, palette_colors, dither_mode="none")
 
     # 5. Tile-specific postprocessing for tile/world workflows.
-    if req.lane == "world" or req.output_mode == "tile_chunk":
+    if req.lane == "world" or req.output_mode in {"tile_chunk", "tile_iso"}:
         if tile.seamless_mode:
             img = _enforce_tile_seamlessness(
                 img,
@@ -1937,6 +2659,7 @@ def _resolve_motion_prior(req: GenerateRequest) -> str:
         return requested
     by_lane = {
         "sprite": "bounce",
+        "iso": "sway",
         "portrait": "sway",
         "prop": "sway",
         "world": "pulse",
@@ -2107,6 +2830,7 @@ def _enhance_prompt(
         trigger = "PIXEL ART"
         lane_depth_hint = {
             "sprite": "32 BIT",
+            "iso": "32 BIT",
             "portrait": "32 BIT",
             "prop": "32 BIT",
             "ui": "16 BIT",
@@ -2135,6 +2859,11 @@ def _enhance_prompt(
             "single game character sprite, full body visible, "
             "isolated on transparent background, orthographic front view, "
             "clean silhouette, distinct outline"
+        ),
+        "iso": (
+            "isometric game asset, 2:1 dimetric projection, three visible faces, "
+            "locked camera angle, readable volume, depth shading, ambient occlusion hints, "
+            "clean silhouette, crisp edge separation"
         ),
         "portrait": (
             "character portrait bust, face centered, "
@@ -2238,9 +2967,6 @@ def _run_generation(record: JobRecord) -> None:
             os.getenv("PIXEL_EXECUTION_DEVICE", "auto"),
         )
 
-    t_pipe = time.perf_counter()
-    pipe = _load_pipeline(req.model_family)
-    timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
     palette_ctx = _resolve_palette_context(req.palette)
     palette_colors: list[str] = palette_ctx["colors"]
     palette_name: str = str(palette_ctx["label"])
@@ -2291,6 +3017,8 @@ def _run_generation(record: JobRecord) -> None:
     # ── source image for img2img (optional, with safe fallback) ───────────────
     init_image: Image.Image | None = None
     source_analysis: SourceAnalysis | None = None
+    control_image: Image.Image | None = None
+    control_metadata: dict[str, Any] | None = None
     if req.source_image_base64:
         t_decode = time.perf_counter()
         raw = base64.b64decode(req.source_image_base64)
@@ -2316,14 +3044,25 @@ def _run_generation(record: JobRecord) -> None:
             source_analysis.processing_applied if source_analysis else [],
         )
 
+    t_pipe = time.perf_counter()
+    pipe = _load_pipeline(req.model_family, req.control_mode)
+    timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
+
     # ── determine output size ─────────────────────────────────────────────────
     w = req.sheet.frame_width
     h = req.sheet.frame_height
+    resource_profile = _resolve_resource_profile()
+    profile_defaults: dict[str, dict[str, int]] = {
+        "daily": {"gen_scale": 4, "min_gen_size": 384, "num_steps": 14},
+        "balanced": {"gen_scale": 6, "min_gen_size": 512, "num_steps": 20},
+        "max": {"gen_scale": 8, "min_gen_size": 640, "num_steps": 28},
+    }
+    defaults = profile_defaults.get(resource_profile, profile_defaults["daily"])
     # Balanced-fast default: generate 6x per target frame, then snap to pixel grid.
     # Keep multiples of 64 (SDXL sweet spot). Default minimum is 512 for SDXL
     # composition quality before pixel-art post-processing.
-    gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", "6")))
-    min_gen_default = "512"
+    gen_scale = max(1, int(os.getenv("PIXEL_GEN_SCALE", str(defaults["gen_scale"]))))
+    min_gen_default = str(defaults["min_gen_size"])
     min_gen_size = max(256, int(os.getenv("PIXEL_MIN_GEN_SIZE", min_gen_default)))
     min_gen_size = ((min_gen_size + 63) // 64) * 64
     gen_w_raw = max(8, w) * gen_scale
@@ -2341,6 +3080,18 @@ def _run_generation(record: JobRecord) -> None:
         min_gen_size,
     )
 
+    if req.control_mode != "none" and init_image is not None:
+        t_control = time.perf_counter()
+        control_image, control_metadata = _build_control_image(init_image, req.control_mode, gen_w, gen_h)
+        log.info(
+            "Job %s control guide prepared in %.2fs | mode=%s size=%dx%d",
+            record.job_id,
+            time.perf_counter() - t_control,
+            req.control_mode,
+            gen_w,
+            gen_h,
+        )
+
     import torch
     # With CPU offload enabled, pipe.device can be "meta". Generator must target
     # a real execution device, not the internal placeholder device.
@@ -2357,8 +3108,8 @@ def _run_generation(record: JobRecord) -> None:
     generator.manual_seed(actual_seed)
     log.info("Job %s seed=%d (requested=%d)", record.job_id, actual_seed, req.seed)
 
-    # 20 steps is a practical speed/quality trade-off for pixel-art lanes.
-    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", "20"))))
+    # Profile-aware defaults keep daily mode responsive while still allowing overrides.
+    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", str(defaults["num_steps"])))) )
     record.progress_total = num_steps
     record.progress_step = 0
 
@@ -2391,7 +3142,7 @@ def _run_generation(record: JobRecord) -> None:
     # Try img2img only when a source image is provided; on compatibility errors,
     # fallback to txt2img so the job still succeeds and returns real outputs.
     result_img = None
-    if init_image is not None:
+    if init_image is not None and req.control_mode == "none":
         try:
             from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl_img2img import (
                 StableDiffusionXLImg2ImgPipeline,
@@ -2439,6 +3190,11 @@ def _run_generation(record: JobRecord) -> None:
             "guidance_scale": req.cfg_scale,
             "generator": generator,
         }
+        if req.control_mode != "none" and control_image is not None:
+            txt2img_kwargs["image"] = control_image
+            txt2img_kwargs["controlnet_conditioning_scale"] = req.control_strength
+            txt2img_kwargs["control_guidance_start"] = req.control_start
+            txt2img_kwargs["control_guidance_end"] = req.control_end
         txt2img_kwargs = _with_progress_callbacks(pipe.__call__, txt2img_kwargs)
         result_img = pipe(**txt2img_kwargs).images[0]
         timing["inference_s"] = round(time.perf_counter() - t_txt2img, 4)
@@ -2534,6 +3290,13 @@ def _run_generation(record: JobRecord) -> None:
             "motion_prior": req.motion_prior,
             "resolved_motion_prior": _resolve_motion_prior(req),
             "frame_scores": frame_scores,
+        },
+        "controlnet": {
+            "mode": req.control_mode,
+            "strength": req.control_strength,
+            "start": req.control_start,
+            "end": req.control_end,
+            "guide": control_metadata,
         },
         "post_processing": req.post_processing.model_dump(),
         "effective_post_processing": effective_pp,
@@ -2676,7 +3439,13 @@ def _record_generation_metrics(job_id: str, req: GenerateRequest, timing: dict[s
 
 def _validate_checkpoint_accessibility() -> dict[str, Any]:
     """Verify that model checkpoints are accessible and readable."""
-    checkpoint_status = {"checkpoint_count": 0, "accessible": [], "missing": [], "error": None}
+    checkpoint_status = {
+        "checkpoint_count": 0,
+        "accessible": [],
+        "missing": [],
+        "unhealthy": [],
+        "error": None,
+    }
 
     try:
         local_checkpoints = _list_local_checkpoints()
@@ -2686,6 +3455,15 @@ def _validate_checkpoint_accessibility() -> dict[str, Any]:
             try:
                 if checkpoint_path.exists() and checkpoint_path.is_file():
                     size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+                    probe = _probe_single_file_checkpoint(checkpoint_path)
+                    if not probe.get("healthy"):
+                        checkpoint_status["unhealthy"].append(
+                            {
+                                "name": checkpoint_path.name,
+                                "size_mb": round(size_mb, 2),
+                                "detail": probe.get("message"),
+                            }
+                        )
                     checkpoint_status["accessible"].append(
                         {"name": checkpoint_path.name, "size_mb": round(size_mb, 2)}
                     )
@@ -2784,6 +3562,9 @@ def _run_startup_self_checks() -> dict[str, Any]:
     if checkpoint_status.get("error"):
         checks["issues"].append(f"Checkpoint check failed: {checkpoint_status['error']}")
         checks["status"] = "degraded"
+    if checkpoint_status.get("unhealthy"):
+        checks["issues"].append("One or more single-file checkpoints failed the readability probe")
+        checks["status"] = "degraded"
     if checkpoint_status["checkpoint_count"] == 0:
         checks["issues"].append("No checkpoints found; generation will fail")
         checks["status"] = "degraded"
@@ -2830,8 +3611,10 @@ def _runtime_diagnostics() -> dict[str, Any]:
             "preferred": "cpu",
             "cuda_available": False,
             "cuda_device_count": 0,
+            "runtime_limits": _RUNTIME_RESOURCE_LIMITS_CACHE,
         },
         "startup_checks": _STARTUP_CHECKS_CACHE,
+        "model_catalog": _build_model_catalog(),
         "generation_metrics": _GENERATION_METRICS_CACHE,
     }
 
@@ -2855,6 +3638,7 @@ def _runtime_diagnostics() -> dict[str, Any]:
             "pipeline_load_dtype": os.getenv("PIXEL_PIPELINE_LOAD_DTYPE", "auto"),
             "pipeline_use_safetensors": _resolve_use_safetensors(),
             "pipeline_disable_mmap": _resolve_disable_mmap(),
+            "runtime_limits": _RUNTIME_RESOURCE_LIMITS_CACHE,
         }
         issues: list[str] = []
         if diffusers_spec is None:
@@ -2916,6 +3700,7 @@ def _run_job(record: JobRecord) -> None:
 
 def create_app() -> FastAPI:
     _configure_logging()
+    _apply_runtime_resource_limits()
     
     # Run startup self-checks (Phase 0.2)
     log.info("Running startup self-checks...")
@@ -2987,6 +3772,7 @@ def create_app() -> FastAPI:
     def healthz() -> dict[str, Any]:
         diagnostics = _runtime_diagnostics()
         startup_checks = diagnostics.get("startup_checks", {})
+        model_catalog = cast(dict[str, Any], diagnostics.get("model_catalog") or {})
         return {
             "status": "ok",
             "runtime": diagnostics["runtime"],
@@ -2994,6 +3780,8 @@ def create_app() -> FastAPI:
             "device": diagnostics["device"],
             "startup_status": startup_checks.get("status", "unknown"),
             "startup_issues": startup_checks.get("issues", []),
+            "available_model_count": len(cast(list[Any], model_catalog.get("models") or [])),
+            "unavailable_model_count": len(cast(list[Any], model_catalog.get("unavailable_models") or [])),
         }
 
     @app.get("/api/pixel/runtime")
@@ -3002,57 +3790,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/pixel/models")
     def list_models() -> dict[str, list[dict[str, str]]]:
-        models: list[dict[str, str]] = [
-            {
-                "id": "sdxl_base",
-                "label": "PAD-XL SpriteShaper (active base)",
-                "quality": "pixel-checkpoint",
-            },
-            # ── pixel-art checkpoints (style baked in, no pixel-art LoRA needed) ─
-            {
-                "id": "pixel_art_diffusion_xl",
-                "label": "Pixel Art Diffusion XL SpriteShaper ★",
-                "quality": "pixel-checkpoint",
-            },
-            # ── sdxl_base + pixel-art LoRAs ─────────────────────────────────────
-            {
-                "id": "sdxl_pixel_art",
-                "label": "SDXL Base + 64×64 Pixel Art LoRA",
-                "quality": "pixel-optimized",
-            },
-            {
-                "id": "sdxl_pixel_art_xl",
-                "label": "SDXL Base + Pixel Art XL v1.1 LoRA",
-                "quality": "pixel-optimized",
-            },
-            # ── general SDXL LoRAs (compatible with any checkpoint) ─────────────
-            {
-                "id": "sdxl_swordsman",
-                "label": "SDXL + Swordsman LoRA",
-                "quality": "character-optimized",
-            },
-            {
-                "id": "sdxl_jinja_shrine",
-                "label": "SDXL + Jinja Shrine Zen LoRA",
-                "quality": "environment-optimized",
-            },
-        ]
-
-        # Known managed checkpoints – skip them from the dynamic catch-all
-        _known_checkpoints = set(_BASE_MODEL_CHECKPOINTS.values())
-        for checkpoint in _list_local_checkpoints():
-            dynamic_id = f"checkpoint:{checkpoint.name}"
-            if checkpoint.name in _known_checkpoints:
-                continue
-            models.append(
-                {
-                    "id": dynamic_id,
-                    "label": f"Checkpoint: {checkpoint.stem}",
-                    "quality": "local-checkpoint",
-                }
-            )
-
-        return {"models": models}
+        return _build_model_catalog()
 
     @app.get("/api/pixel/export-formats")
     def list_export_formats() -> dict[str, list[dict[str, str]]]:
@@ -3132,9 +3870,20 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="source_image_base64 must be a PNG in base64 format")
 
         try:
-            _resolve_model_spec(request.model_family)
+            checkpoint_path, lora_file = _resolve_model_spec(request.model_family)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        requested_model_source = _resolve_model_source()
+        diffusers_dir = _resolve_diffusers_model_dir(request.model_family, checkpoint_path, lora_file)
+        effective_model_source = "diffusers" if requested_model_source == "diffusers" or (
+            requested_model_source == "auto" and diffusers_dir is not None
+        ) else "single_file"
+        if effective_model_source == "single_file":
+            try:
+                _ensure_single_file_checkpoint_healthy(checkpoint_path, request.model_family)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # Defensive lazy-start so queue processing still works when startup
         # lifecycle hooks are not executed (for example in some test harnesses).

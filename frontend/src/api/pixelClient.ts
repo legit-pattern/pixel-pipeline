@@ -166,6 +166,14 @@ export type GenerateRequest = {
   frame_retry_budget?: number;
   /** Motion prior hint: auto|bloom|pulse|sway|rotate|bounce|flicker|dissolve. */
   motion_prior?: string;
+  /** Structural guide mode: none|depth|canny. Requires source image. */
+  control_mode?: string;
+  /** ControlNet conditioning scale. */
+  control_strength?: number;
+  /** Fraction of denoising timeline where control starts. */
+  control_start?: number;
+  /** Fraction of denoising timeline where control ends. */
+  control_end?: number;
 };
 
 export type JobResult = {

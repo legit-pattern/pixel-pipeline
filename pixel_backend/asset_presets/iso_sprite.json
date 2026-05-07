@@ -1,0 +1,20 @@
+{
+  "id": "iso_sprite",
+  "label": "Iso Sprite",
+  "prompt_tags": [
+    "isometric sprite",
+    "2:1 dimetric projection",
+    "three visible faces",
+    "readable volume"
+  ],
+  "post_processing": {
+    "pixel_cleanup": true,
+    "outline_strength": 2,
+    "anti_alias_level": 2,
+    "cluster_smoothing": 1,
+    "contrast_boost": 1,
+    "shadow_reinforcement": 2,
+    "highlight_reinforcement": 1,
+    "palette_strictness": 1
+  }
+}

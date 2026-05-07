@@ -40,25 +40,6 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _materialize_checkpoint(checkpoint_path: pathlib.Path) -> dict[str, object]:
-    from safetensors import safe_open
-
-    started = time.perf_counter()
-    checkpoint: dict[str, object] = {}
-
-    with safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
-        keys = list(handle.keys())
-        total = len(keys)
-        print(f"[convert] reading {total} tensors from {checkpoint_path.name}")
-        for index, key in enumerate(keys, start=1):
-            checkpoint[key] = handle.get_tensor(key)
-            if index == total or index % 250 == 0:
-                print(f"[convert] materialized {index}/{total} tensors")
-
-    print(f"[convert] checkpoint materialized in {time.perf_counter() - started:.2f}s")
-    return checkpoint
-
-
 def main() -> int:
     args = _parse_args()
     checkpoint_path = args.checkpoint.resolve()
@@ -84,15 +65,16 @@ def main() -> int:
     )
 
     try:
-        checkpoint = _materialize_checkpoint(checkpoint_path)
-        print("[convert] building StableDiffusionXLPipeline from checkpoint tensors")
+        print(f"[convert] building StableDiffusionXLPipeline from {checkpoint_path.name}")
+        started = time.perf_counter()
         pipeline = download_from_original_stable_diffusion_ckpt(
-            checkpoint_path_or_dict=checkpoint,
-            from_safetensors=False,
+            checkpoint_path_or_dict=str(checkpoint_path),
+            from_safetensors=checkpoint_path.suffix.lower() == ".safetensors",
             pipeline_class=StableDiffusionXLPipeline,
             load_safety_checker=False,
             local_files_only=args.local_files_only,
         )
+        print(f"[convert] pipeline built in {time.perf_counter() - started:.2f}s")
 
         if output_dir.exists() and args.force:
             for child in output_dir.iterdir():
