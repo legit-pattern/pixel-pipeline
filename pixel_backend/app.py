@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import gc
 import importlib.metadata
 import importlib.util
@@ -48,7 +49,7 @@ _CHECKPOINT_EXTS = {".safetensors", ".ckpt"}
 
 # model_family -> LoRA file (relative to models/Lora/)
 # LoRA compatibility:
-#   ONLY use pixel-art LoRAs (sdxl_pixel_art, sdxl_pixel_art_xl, sdxl_pixel_art_redmond)
+#   ONLY use pixel-art LoRAs (sdxl_pixel_art, sdxl_pixel_art_xl)
 #   with sdxl_base.  Pixel-art checkpoints (pixel_art_diffusion_xl) already have the
 #   style trained in – adding a pixel-art LoRA will fight the checkpoint and degrade output.
 #   General SDXL LoRAs (swordsman, jinja_shrine) are safe with any checkpoint.
@@ -56,6 +57,9 @@ _LORA_MAP: dict[str, str] = {
     # ── pixel-art LoRAs (use with sdxl_base only) ──────────────────────────
     "sdxl_pixel_art": "64x64_Pixel_Art_SDXL.safetensors",
     "sdxl_pixel_art_xl": "pixel-art-xl-v1.1.safetensors",
+    # ── isometric pixel-art LoRAs (use with sdxl_base for iso lane) ────────
+    "sdxl_iso_landscape": "isometric_landscape_sprites_sdxl_v1.safetensors",
+    "sdxl_iso_monsters": "isometric_monster_sprites_sdxl_v1.safetensors",
     # ── general SDXL LoRAs (safe with any checkpoint) ──────────────────────
     "sdxl_swordsman": "SwordsmanXL.safetensors",
     "sdxl_jinja_shrine": "Jinja_Shrine_Zen_SDXL.safetensors",
@@ -94,8 +98,125 @@ _ALLOWED_OUTPUT_MODES = {
 }
 _HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 
-# ── lazy pipeline cache ────────────────────────────────────────────────────────
-_PIPELINE_CACHE: dict[str, Any] = {}
+# ── trigger profiles ───────────────────────────────────────────────────────────
+# Minimal trigger injection per model_family. Applied even when enhance=False so
+# the model's own conditioning words are always present.  Keep to ≤6 tokens so
+# they fit safely within CLIP's 77-token budget regardless of user prompt length.
+_TRIGGER_PROFILES: dict[str, dict[str, str]] = {
+    # Yamer's sprite-shaper: trigger word + optional bit-depth qualifier
+    "pixel_art_diffusion_xl": {
+        "sprite":    "PIXEL ART, 32 BIT",
+        "iso":       "PIXEL ART, 32 BIT",
+        "portrait":  "PIXEL ART, 32 BIT",
+        "prop":      "PIXEL ART, 32 BIT",
+        "ui":        "PIXEL ART, 16 BIT",
+        "detail":    "PIXEL ART, 64 BIT",
+        "world":     "PIXEL ART, 16 BIT",
+        "atmosphere": "PIXEL ART, 16 BIT",
+        "concept":   "PIXEL ART, 64 BIT",
+        "_default":  "PIXEL ART",
+    },
+    # Raw SDXL base with pixel-art LoRA – no checkpoint triggers, LoRA activates on its own
+    "sdxl_base": {
+        "_default": "",
+    },
+}
+
+def _get_model_trigger(model_family: str, lane: str) -> str:
+    """Return the minimal trigger string for this model+lane combination."""
+    profile = _TRIGGER_PROFILES.get(model_family, {})
+    return profile.get(lane) or profile.get("_default") or ""
+
+
+# ── lane stack router ──────────────────────────────────────────────────────────
+# Canonical production stack per lane.  Each entry defines:
+#   model_family  – preferred checkpoint family for this lane
+#   lora          – preferred LoRA key from _LORA_MAP (or None for no LoRA)
+#   output_mode   – default output_mode for this lane
+#   cfg_scale     – recommended guidance scale
+#   steps         – recommended step count
+#   notes         – short human-readable rationale
+#
+# This is the single authoritative routing table.  If a request does not
+# specify a model_family / lora, the API picks from this table.
+# The table is also returned by GET /api/pixel/lanes so the frontend can
+# show lane metadata without hard-coding it.
+_LANE_STACK: dict[str, dict[str, Any]] = {
+    "sprite": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,                 # baked-in style; no pixel-art LoRA needed
+        "output_mode": "single_sprite",
+        "cfg_scale": 7.5,
+        "steps": 20,
+        "notes": "Yamer sprite-shaper, trigger: PIXEL ART 32 BIT",
+    },
+    "iso": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": "sdxl_iso_landscape",
+        "output_mode": "tile_iso",
+        "cfg_scale": 7.5,
+        "steps": 20,
+        "notes": "Sprite-shaper + iso landscape LoRA; swap to sdxl_iso_monsters for characters",
+    },
+    "world": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "tile_chunk",
+        "cfg_scale": 7.0,
+        "steps": 20,
+        "notes": "Top-down / ortho world tile; lower CFG for softer terrain blends",
+    },
+    "prop": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "prop_sheet",
+        "cfg_scale": 7.5,
+        "steps": 20,
+        "notes": "Single isolated game prop with transparent background",
+    },
+    "ui": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "ui_module",
+        "cfg_scale": 6.5,
+        "steps": 18,
+        "notes": "Flat 16-bit-style UI icon/module; lower CFG avoids over-sharpening",
+    },
+    "portrait": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "single_sprite",
+        "cfg_scale": 7.5,
+        "steps": 24,
+        "notes": "Character portrait bust; extra steps for face detail",
+    },
+    "detail": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "tile_chunk",
+        "cfg_scale": 7.0,
+        "steps": 20,
+        "notes": "Close-up texture / detail tile",
+    },
+    "atmosphere": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "tile_chunk",
+        "cfg_scale": 6.0,
+        "steps": 18,
+        "notes": "Soft background / sky layer; low CFG for smooth palette blends",
+    },
+    "concept": {
+        "model_family": "pixel_art_diffusion_xl",
+        "lora": None,
+        "output_mode": "single_sprite",
+        "cfg_scale": 8.0,
+        "steps": 24,
+        "notes": "Stylised concept / splash art; higher CFG for definition",
+    },
+}
+
+
 _CONTROLNET_CACHE: dict[str, Any] = {}
 _CHECKPOINT_PROBE_CACHE: dict[str, dict[str, Any]] = {}
 _SINGLE_FILE_LOAD_PROBE_CACHE: dict[str, dict[str, Any]] = {}
@@ -105,6 +226,9 @@ _PALETTE_CACHE: dict[str, dict[str, Any]] | None = None
 _ASSET_PRESET_CACHE: dict[str, dict[str, Any]] | None = None
 _CHARACTER_DNA_CACHE: dict[str, dict[str, Any]] | None = None
 _DEPTH_GUIDE_COMPONENTS: tuple[Any, Any] | None = None
+_PIPELINE_CACHE: dict[str, Any] = {}
+_MODEL_CATALOG_CACHE: tuple[float, dict[str, list[dict[str, Any]]]] | None = None
+_MODEL_CATALOG_CACHE_TTL: float = 60.0
 
 # ── generation worker queue (single GPU-safe worker by default) ───────────────
 _JOB_QUEUE: deque[str] = deque()
@@ -283,7 +407,7 @@ def _apply_runtime_resource_limits() -> dict[str, Any]:
 
     cpu_threads = _resolve_int_env("PIXEL_CPU_THREADS", cpu_threads_default, 1, max(1, cpu_count))
     cpu_interop_threads = _resolve_int_env("PIXEL_CPU_INTEROP_THREADS", interop_default, 1, max(1, cpu_count))
-    requested_cuda_memory_fraction = _resolve_float_env("PIXEL_CUDA_MEMORY_FRACTION", 0.72, 0.2, 0.95)
+    requested_cuda_memory_fraction = _resolve_float_env("PIXEL_CUDA_MEMORY_FRACTION", 0.90, 0.2, 0.98)
     cuda_reserved_vram_mb = _resolve_int_env("PIXEL_CUDA_RESERVED_VRAM_MB", 2048, 256, 24576)
     cuda_memory_fraction = requested_cuda_memory_fraction
     process_priority = _apply_process_priority()
@@ -313,11 +437,18 @@ def _apply_runtime_resource_limits() -> dict[str, Any]:
 
         execution_device = _resolve_execution_device(torch)
         if execution_device == "cuda" and torch.cuda.is_available():
+            # Enable expandable segments to reduce fragmentation at VAE decode time.
+            # Without this, large contiguous allocations can fail even when free VRAM exists.
+            import os as _os
+            _existing_alloc_conf = _os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            if "expandable_segments" not in _existing_alloc_conf:
+                _sep = "," if _existing_alloc_conf else ""
+                _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _existing_alloc_conf + _sep + "expandable_segments:True"
             try:
                 total_vram_mb = int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
                 budget_fraction = max(
                     0.2,
-                    min(0.95, (total_vram_mb - cuda_reserved_vram_mb) / float(max(1, total_vram_mb))),
+                    min(0.98, (total_vram_mb - cuda_reserved_vram_mb) / float(max(1, total_vram_mb))),
                 )
                 cuda_memory_fraction = min(requested_cuda_memory_fraction, budget_fraction)
                 torch.cuda.set_per_process_memory_fraction(cuda_memory_fraction, device=0)
@@ -665,6 +796,15 @@ class GenerateRequest(BaseModel):
     """Fraction of denoising timeline where control begins."""
     control_end: float = Field(default=1.0, ge=0.0, le=1.0)
     """Fraction of denoising timeline where control ends."""
+    iso_depth_guide: bool = False
+    """When True and lane=iso, auto-generate a synthetic isometric depth map and use it as a
+    depth ControlNet guide – no source_image required.  Ignored for non-iso lanes."""
+    iso_elevation: float = Field(default=26.565, ge=10.0, le=60.0)
+    """Camera elevation in degrees for synthetic iso depth guide.
+    26.565° = classic 2:1 pixel-art dimetric.  Try 30° for a rounder look."""
+    iso_azimuth: float = Field(default=45.0, ge=0.0, le=360.0)
+    """Camera azimuth (rotation around vertical axis) for synthetic depth guide.
+    45° = NE-facing (standard SNES/GBA isometric).  0/90/180/270 for cardinal faces."""
 
 
 class JobResponse(BaseModel):
@@ -1789,37 +1929,61 @@ def _is_model_family_available(model_family: str) -> bool:
     return bool(_get_model_family_availability(model_family).get("available"))
 
 
-def _build_model_catalog() -> dict[str, list[dict[str, str]]]:
-    managed_models: list[dict[str, str]] = [
+def _build_model_catalog() -> dict[str, list[dict[str, Any]]]:
+    global _MODEL_CATALOG_CACHE
+    if _MODEL_CATALOG_CACHE is not None:
+        ts, cached = _MODEL_CATALOG_CACHE
+        if time.time() - ts < _MODEL_CATALOG_CACHE_TTL:
+            return cached
+
+    managed_models: list[dict[str, Any]] = [
         {
             "id": "sdxl_base",
             "label": "PAD-XL SpriteShaper (active base)",
             "quality": "pixel-checkpoint",
+            "recommended_lanes": ["sprite", "world", "prop", "ui", "detail", "atmosphere", "concept"],
         },
         {
             "id": "pixel_art_diffusion_xl",
             "label": "Pixel Art Diffusion XL SpriteShaper ★",
             "quality": "pixel-checkpoint",
+            "recommended_lanes": ["sprite", "world", "prop", "ui", "detail", "atmosphere", "concept"],
         },
         {
             "id": "sdxl_pixel_art",
             "label": "SDXL Base + 64×64 Pixel Art LoRA",
             "quality": "pixel-optimized",
+            "recommended_lanes": ["sprite", "world", "prop"],
         },
         {
             "id": "sdxl_pixel_art_xl",
             "label": "SDXL Base + Pixel Art XL v1.1 LoRA",
             "quality": "pixel-optimized",
+            "recommended_lanes": ["sprite", "world", "prop"],
+        },
+        {
+            "id": "sdxl_iso_landscape",
+            "label": "SDXL Base + Isometric Landscape Sprites LoRA",
+            "quality": "iso-optimized",
+            "recommended_lanes": ["iso"],
+        },
+        {
+            "id": "sdxl_iso_monsters",
+            "label": "SDXL Base + Isometric Monster Sprites LoRA",
+            "quality": "iso-optimized",
+            "recommended_lanes": ["iso"],
         },
         {
             "id": "sdxl_swordsman",
             "label": "SDXL + Swordsman LoRA",
             "quality": "character-optimized",
+            "recommended_lanes": ["sprite", "iso", "portrait", "concept"],
         },
         {
             "id": "sdxl_jinja_shrine",
             "label": "SDXL + Jinja Shrine Zen LoRA",
             "quality": "environment-optimized",
+            "recommended_lanes": ["world", "iso", "atmosphere", "concept"],
         },
     ]
 
@@ -1862,7 +2026,12 @@ def _build_model_catalog() -> dict[str, list[dict[str, str]]]:
             }
         )
 
-    return {"models": available_models, "unavailable_models": unavailable_models}
+    result: dict[str, list[dict[str, Any]]] = {
+        "models": available_models,
+        "unavailable_models": unavailable_models,
+    }
+    _MODEL_CATALOG_CACHE = (time.time(), result)
+    return result
 
 
 def _load_pipeline_from_diffusers_dir(
@@ -1990,6 +2159,105 @@ def _get_depth_guide_components() -> tuple[Any, Any]:
     depth_estimator.eval()
     _DEPTH_GUIDE_COMPONENTS = (feature_extractor, depth_estimator)
     return _DEPTH_GUIDE_COMPONENTS
+
+
+def _generate_synthetic_iso_depth(
+    elevation_deg: float,
+    azimuth_deg: float,
+    width: int,
+    height: int,
+) -> "PIL.Image.Image":
+    """Generate a synthetic isometric depth map for ControlNet guidance.
+
+    Renders a flat ground plane + unit cube viewed from the given elevation/azimuth.
+    The depth values are normalized to [0, 1] (white = near, black = far) and returned
+    as an RGB PIL image for direct use with the depth ControlNet.
+
+    elevation_deg : camera tilt above the horizon (26.565 = classic 2:1 dimetric)
+    azimuth_deg   : camera yaw around vertical axis (45 = NE-facing standard iso)
+    """
+    import math
+    import numpy as np
+    from PIL import Image
+
+    el = math.radians(elevation_deg)
+    az = math.radians(azimuth_deg)
+
+    # Camera direction vector (unit vector pointing from scene into the camera)
+    cx = math.cos(el) * math.sin(az)
+    cy = math.sin(el)
+    cz = math.cos(el) * math.cos(az)
+
+    # Build an orthographic projection matrix: world-space XZ is ground, Y is up
+    # right axis  = az rotated 90° in XZ plane
+    rx = math.cos(az)
+    ry = 0.0
+    rz = -math.sin(az)
+    # up axis = cross(camera, right) – already guaranteed orthogonal
+    ux = -math.sin(el) * math.sin(az)
+    uy = math.cos(el)
+    uz = -math.sin(el) * math.cos(az)
+
+    # Sample world-space grid centred at origin
+    # Grid spans -1..1 in both ground-plane axes; includes a unit cube above ground
+    grid_res = 64  # number of samples per axis
+    x_vals = np.linspace(-1.5, 1.5, grid_res)
+    z_vals = np.linspace(-1.5, 1.5, grid_res)
+
+    depth_map = np.zeros((height, width), dtype=np.float32)
+
+    # --- ground plane (y=0) ---
+    for gx in x_vals:
+        for gz in z_vals:
+            world = np.array([gx, 0.0, gz])
+            px = rx * world[0] + ry * world[1] + rz * world[2]
+            py = ux * world[0] + uy * world[1] + uz * world[2]
+            d = cx * world[0] + cy * world[1] + cz * world[2]
+
+            # Map projected coords to pixel
+            img_x = int((px + 1.5) / 3.0 * (width - 1))
+            img_y = int((1.0 - (py + 1.0) / 2.5) * (height - 1))
+            if 0 <= img_x < width and 0 <= img_y < height:
+                depth_map[img_y, img_x] = max(depth_map[img_y, img_x], d + 2.0)
+
+    # --- unit cube (x: -0.4..0.4, y: 0..0.8, z: -0.4..0.4) ---
+    cube_x = np.linspace(-0.4, 0.4, 32)
+    cube_y = np.linspace(0.0, 0.8, 32)
+    cube_z = np.linspace(-0.4, 0.4, 32)
+    for face_points in [
+        # top face
+        [(gx, 0.8, gz) for gx in cube_x for gz in cube_z],
+        # front-right face (toward camera)
+        [(0.4, gy, gz) for gy in cube_y for gz in cube_z],
+        # front-left face
+        [(gx, gy, -0.4) for gx in cube_x for gy in cube_y],
+    ]:
+        for world_pt in face_points:
+            world = np.array(world_pt)
+            px = rx * world[0] + ry * world[1] + rz * world[2]
+            py = ux * world[0] + uy * world[1] + uz * world[2]
+            d = cx * world[0] + cy * world[1] + cz * world[2]
+            img_x = int((px + 1.5) / 3.0 * (width - 1))
+            img_y = int((1.0 - (py + 1.0) / 2.5) * (height - 1))
+            if 0 <= img_x < width and 0 <= img_y < height:
+                depth_map[img_y, img_x] = max(depth_map[img_y, img_x], d + 2.5)
+
+    # Smooth & normalize to 0-1 (1 = near)
+    from scipy.ndimage import gaussian_filter  # type: ignore[import-untyped]
+    try:
+        depth_map = gaussian_filter(depth_map, sigma=3)
+    except Exception:
+        pass  # scipy optional – skip smoothing
+
+    d_min, d_max = depth_map.min(), depth_map.max()
+    if d_max > d_min:
+        depth_map = (depth_map - d_min) / (d_max - d_min)
+    else:
+        depth_map = np.zeros_like(depth_map)
+
+    depth_uint8 = (depth_map * 255).clip(0, 255).astype(np.uint8)
+    rgb = np.stack([depth_uint8] * 3, axis=-1)
+    return Image.fromarray(rgb, mode="RGB").resize((width, height), Image.Resampling.BICUBIC)
 
 
 def _build_control_image(
@@ -2156,24 +2424,37 @@ def _load_pipeline(model_family: str, control_mode: str = "none") -> Any:
         pipe = StableDiffusionXLControlNetPipeline(controlnet=controlnet, **pipe.components)
         log.info("ControlNet pipeline assembled in %.2fs (mode=%s)", time.perf_counter() - t_control, control_mode)
     if device == "cuda":
-        # Prefer sequential offload on 12GB cards: slower, but significantly lower peak VRAM.
-        # Do NOT call pipe.to("cuda") before offload; hooks manage placement automatically.
-        offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "sequential").strip().lower()
-        if offload_mode == "model":
-            _log_gpu_stage(torch, "before_enable_model_cpu_offload")
-            pipe.enable_model_cpu_offload()
-            log.info("CUDA offload mode: model")
-            _log_gpu_stage(torch, "after_enable_model_cpu_offload")
+        # Cast VAE to fp16 before applying any offload hooks.
+        # enable_sequential_cpu_offload leaves VAE bias tensors in float32 when loaded
+        # from a checkpoint, causing a dtype mismatch (c10::Half vs float) in post_quant_conv.
+        # Casting here ensures all VAE parameters are float16 before hooks are registered.
+        if hasattr(pipe, "vae") and dtype is not None:
+            try:
+                pipe.vae = pipe.vae.to(dtype=dtype)
+                log.info("VAE cast to %s", dtype)
+            except Exception as _vae_cast_exc:
+                log.warning("VAE dtype cast failed (%s) – continuing", _vae_cast_exc)
+
+        # Prefer model-level offload on 12GB cards: moves whole sub-modules
+        # one at a time (UNet → text_encoder → VAE). Avoids the layer-level
+        # dtype mismatch that enable_sequential_cpu_offload introduces.
+        # Users can override with PIXEL_CUDA_OFFLOAD_MODE=sequential or none.
+        offload_mode = os.getenv("PIXEL_CUDA_OFFLOAD_MODE", "model").strip().lower()
+        if offload_mode == "sequential":
+            _log_gpu_stage(torch, "before_enable_sequential_cpu_offload")
+            pipe.enable_sequential_cpu_offload()
+            log.info("CUDA offload mode: sequential")
+            _log_gpu_stage(torch, "after_enable_sequential_cpu_offload")
         elif offload_mode == "none":
             _log_gpu_stage(torch, "before_pipe_to_cuda")
             pipe = pipe.to("cuda")
             log.info("CUDA offload mode: none (direct cuda)")
             _log_gpu_stage(torch, "after_pipe_to_cuda")
         else:
-            _log_gpu_stage(torch, "before_enable_sequential_cpu_offload")
-            pipe.enable_sequential_cpu_offload()
-            log.info("CUDA offload mode: sequential")
-            _log_gpu_stage(torch, "after_enable_sequential_cpu_offload")
+            _log_gpu_stage(torch, "before_enable_model_cpu_offload")
+            pipe.enable_model_cpu_offload()
+            log.info("CUDA offload mode: model")
+            _log_gpu_stage(torch, "after_enable_model_cpu_offload")
     else:
         pipe = pipe.to(device)
     _log_gpu_stage(torch, "before_attention_slicing")
@@ -2807,6 +3088,30 @@ def _build_keyframe_sequence(
     return frames, scores
 
 
+def _iso_azimuth_label(azimuth_deg: float) -> str:
+    """Convert azimuth degrees to a compass-style descriptor for prompt injection."""
+    # Normalise to 0-360
+    az = azimuth_deg % 360
+    dirs = [
+        (0,   "north-east facing"),
+        (45,  "north-east facing"),
+        (90,  "south-east facing"),
+        (135, "south-east facing"),
+        (180, "south-west facing"),
+        (225, "south-west facing"),
+        (270, "north-west facing"),
+        (315, "north-west facing"),
+    ]
+    label = "north-east facing"
+    best_dist = 360.0
+    for deg, lbl in dirs:
+        dist = min(abs(az - deg), 360 - abs(az - deg))
+        if dist < best_dist:
+            best_dist = dist
+            label = lbl
+    return label
+
+
 def _enhance_prompt(
     prompt: str,
     lane: str,
@@ -2814,6 +3119,8 @@ def _enhance_prompt(
     palette_name: str,
     strict_palette_lock: bool = False,
     model_family: str = "",
+    iso_elevation: float = 26.565,
+    iso_azimuth: float = 45.0,
 ) -> str:
     """Inject lane-specific pixel-art quality keywords into the prompt.
 
@@ -2845,7 +3152,7 @@ def _enhance_prompt(
         if strict_palette_lock and palette_colors:
             n = len(palette_colors)
             parts.append(f"strict {n}-colour palette, flat fills")
-        return ", ".join(parts)
+        return _trim_to_clip_budget(", ".join(parts))
 
     # ── sdxl_base + LoRA path: full quality anchor set ───────────────────────
     # Base pixel-art anchors that every lane benefits from
@@ -2854,17 +3161,21 @@ def _enhance_prompt(
         "game sprite, 2D flat shading, no gradients, no blur"
     )
 
+    # Iso lane: build angle-precise tags from elevation + azimuth params
+    _iso_angle_tag = (
+        f"isometric game asset, 2:1 dimetric projection, three visible faces, "
+        f"locked camera angle, {_iso_azimuth_label(iso_azimuth)}, "
+        f"{iso_elevation:.1f} degree elevation, "
+        f"readable volume, depth shading, ambient occlusion hints, "
+        f"clean silhouette, crisp edge separation"
+    )
     lane_tags: dict[str, str] = {
         "sprite": (
             "single game character sprite, full body visible, "
             "isolated on transparent background, orthographic front view, "
             "clean silhouette, distinct outline"
         ),
-        "iso": (
-            "isometric game asset, 2:1 dimetric projection, three visible faces, "
-            "locked camera angle, readable volume, depth shading, ambient occlusion hints, "
-            "clean silhouette, crisp edge separation"
-        ),
+        "iso": _iso_angle_tag,
         "portrait": (
             "character portrait bust, face centered, "
             "clear facial features readable at small size, "
@@ -2919,7 +3230,29 @@ def _enhance_prompt(
     if palette_hint:
         parts.append(palette_hint)
 
-    return ", ".join(parts)
+    return _trim_to_clip_budget(", ".join(parts))
+
+
+def _trim_to_clip_budget(text: str, max_tokens: int = 75) -> str:
+    """Trim comma-separated tag list to stay within CLIP's 77-token limit.
+
+    Uses a word-count heuristic (1 token ≈ 0.75 words) so we stay safely
+    under the hard limit without requiring the actual tokeniser at call-time.
+    The first two comma-chunks (trigger + subject) are always preserved.
+    """
+    chunks = [c.strip() for c in text.split(",") if c.strip()]
+    budget = max_tokens
+    kept: list[str] = []
+    for i, chunk in enumerate(chunks):
+        # Rough token estimate: words * 1.33 (subword overhead)
+        estimated = max(1, round(len(chunk.split()) * 1.33))
+        if i < 2 or budget - estimated >= 0:
+            kept.append(chunk)
+            budget -= estimated
+        # Once we've hit the budget, stop adding more chunks
+        if budget <= 0:
+            break
+    return ", ".join(kept)
 
 
 def _run_generation(record: JobRecord) -> None:
@@ -2998,14 +3331,22 @@ def _run_generation(record: JobRecord) -> None:
             palette_name,
             strict_palette_lock,
             req.model_family,
+            iso_elevation=req.iso_elevation,
+            iso_azimuth=req.iso_azimuth,
         )
     else:
+        # Even with enhance disabled, inject the model trigger so the checkpoint
+        # activates its own conditioning. This is a ≤6-token overhead.
+        trigger = _get_model_trigger(req.model_family, req.lane)
         palette_hint = ""
         if palette_name and palette_name.lower() != "custom":
             palette_hint += f", using the {palette_name} palette"
         if palette_colors:
             palette_hint += f", strict limited palette, {len(palette_colors)} colors"
-        full_prompt = prompt_base + palette_hint
+        if trigger:
+            full_prompt = f"{trigger}, {prompt_base}{palette_hint}"
+        else:
+            full_prompt = prompt_base + palette_hint
     log.info(
         "Job %s prompt prepared | prompt_len=%d neg_len=%d palette_colors=%d",
         record.job_id,
@@ -3019,6 +3360,13 @@ def _run_generation(record: JobRecord) -> None:
     source_analysis: SourceAnalysis | None = None
     control_image: Image.Image | None = None
     control_metadata: dict[str, Any] | None = None
+
+    # Synthetic iso depth guide: auto-activate depth ControlNet for iso lane
+    # when the caller has not supplied a source image but iso_depth_guide=True.
+    effective_control_mode = req.control_mode
+    if req.iso_depth_guide and req.lane == "iso" and not req.source_image_base64:
+        effective_control_mode = "depth"
+
     if req.source_image_base64:
         t_decode = time.perf_counter()
         raw = base64.b64decode(req.source_image_base64)
@@ -3045,7 +3393,7 @@ def _run_generation(record: JobRecord) -> None:
         )
 
     t_pipe = time.perf_counter()
-    pipe = _load_pipeline(req.model_family, req.control_mode)
+    pipe = _load_pipeline(req.model_family, effective_control_mode)
     timing["pipeline_load_s"] = round(time.perf_counter() - t_pipe, 4)
 
     # ── determine output size ─────────────────────────────────────────────────
@@ -3080,14 +3428,29 @@ def _run_generation(record: JobRecord) -> None:
         min_gen_size,
     )
 
-    if req.control_mode != "none" and init_image is not None:
+    if effective_control_mode != "none":
         t_control = time.perf_counter()
-        control_image, control_metadata = _build_control_image(init_image, req.control_mode, gen_w, gen_h)
+        if req.iso_depth_guide and req.lane == "iso" and init_image is None:
+            # No source image supplied: generate a synthetic isometric depth map
+            control_image = _generate_synthetic_iso_depth(
+                req.iso_elevation, req.iso_azimuth, gen_w, gen_h
+            )
+            control_metadata = {
+                "mode": "depth",
+                "guide_size": {"width": gen_w, "height": gen_h},
+                "preprocess": "synthetic_iso",
+                "elevation_deg": req.iso_elevation,
+                "azimuth_deg": req.iso_azimuth,
+            }
+        elif init_image is not None:
+            control_image, control_metadata = _build_control_image(
+                init_image, effective_control_mode, gen_w, gen_h
+            )
         log.info(
             "Job %s control guide prepared in %.2fs | mode=%s size=%dx%d",
             record.job_id,
             time.perf_counter() - t_control,
-            req.control_mode,
+            effective_control_mode,
             gen_w,
             gen_h,
         )
@@ -3104,12 +3467,12 @@ def _run_generation(record: JobRecord) -> None:
             # Keep generation resilient if memory stats are unavailable.
             pass
     # seed=-1 means random; any other value is used directly for reproducibility
-    actual_seed = req.seed if req.seed >= 0 else int(time.time()) & 0xFFFFFFFF
+    actual_seed = req.seed if req.seed >= 0 else int.from_bytes(os.urandom(4), "little")
     generator.manual_seed(actual_seed)
     log.info("Job %s seed=%d (requested=%d)", record.job_id, actual_seed, req.seed)
 
     # Profile-aware defaults keep daily mode responsive while still allowing overrides.
-    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", str(defaults["num_steps"])))) )
+    num_steps = max(8, min(60, int(os.getenv("PIXEL_NUM_STEPS", str(defaults["num_steps"])))))
     record.progress_total = num_steps
     record.progress_step = 0
 
@@ -3181,16 +3544,26 @@ def _run_generation(record: JobRecord) -> None:
     if result_img is None:
         t_txt2img = time.perf_counter()
         log.info("Job %s starting txt2img inference", record.job_id)
+        # Auto-inject iso anti-drift negatives when in iso lane.
+        # Prevents SDXL from slipping to front-view / top-down / perspective shots.
+        _ISO_NEGATIVE = (
+            "front view, side view, top-down, flat overhead, bird's eye, "
+            "aerial view, straight-on, perspective distortion, first person, "
+            "3/4 front view, close-up, no depth, flat projection"
+        )
+        effective_negative = req.negative_prompt or ""
+        if req.lane == "iso" and _ISO_NEGATIVE not in effective_negative:
+            effective_negative = (_ISO_NEGATIVE + ", " + effective_negative).strip(", ")
         txt2img_kwargs = {
             "prompt": full_prompt,
-            "negative_prompt": req.negative_prompt or None,
+            "negative_prompt": effective_negative or None,
             "width": gen_w,
             "height": gen_h,
             "num_inference_steps": num_steps,
             "guidance_scale": req.cfg_scale,
             "generator": generator,
         }
-        if req.control_mode != "none" and control_image is not None:
+        if effective_control_mode != "none" and control_image is not None:
             txt2img_kwargs["image"] = control_image
             txt2img_kwargs["controlnet_conditioning_scale"] = req.control_strength
             txt2img_kwargs["control_guidance_start"] = req.control_start
@@ -3656,11 +4029,15 @@ def _runtime_diagnostics() -> dict[str, Any]:
         return diagnostics
 
 
-def _error_code_from_exception(exc: BaseException) -> str:
-    name = type(exc).__name__
+@functools.lru_cache(maxsize=128)
+def _error_code_from_class_name(name: str) -> str:
     pieces = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", name)
     normalized = "_".join(part.lower() for part in pieces if part)
     return normalized or "generation_failed"
+
+
+def _error_code_from_exception(exc: BaseException) -> str:
+    return _error_code_from_class_name(type(exc).__name__)
 
 
 def _run_job(record: JobRecord) -> None:
@@ -3686,7 +4063,7 @@ def _run_job(record: JobRecord) -> None:
             record.result = None
             record.error = None
             log.info("Job %s marked cancelled after generation return", record.job_id)
-    except BaseException as exc:
+    except Exception as exc:
         log.exception("Generation failed for job %s", record.job_id)
         record.status = "failure"
         record.phase = "failed"
@@ -3791,6 +4168,11 @@ def create_app() -> FastAPI:
     @app.get("/api/pixel/models")
     def list_models() -> dict[str, list[dict[str, str]]]:
         return _build_model_catalog()
+
+    @app.get("/api/pixel/lanes")
+    def list_lanes() -> dict[str, Any]:
+        """Return the canonical lane stack router table for frontend/tooling use."""
+        return {"lanes": _LANE_STACK}
 
     @app.get("/api/pixel/export-formats")
     def list_export_formats() -> dict[str, list[dict[str, str]]]:

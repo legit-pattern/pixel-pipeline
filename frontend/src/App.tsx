@@ -98,13 +98,40 @@ type QuickStartPreset = {
   lane: string;
   outputMode: string;
   outputFormat: string;
+  preferredModelFamilies?: string[];
 };
 
 const QUICK_START_PRESETS: QuickStartPreset[] = [
+  {
+    label: "Standard Pixel Art",
+    lane: "sprite",
+    outputMode: "single_sprite",
+    outputFormat: "png",
+    preferredModelFamilies: ["pixel_art_diffusion_xl", "sdxl_pixel_art", "sdxl_base"],
+  },
+  {
+    label: "Isometric Pixel Art",
+    lane: "iso",
+    outputMode: "single_sprite",
+    outputFormat: "png",
+    preferredModelFamilies: ["sdxl_iso_landscape", "sdxl_iso_monsters", "pixel_art_diffusion_xl"],
+  },
   { label: "Character Sprite", lane: "sprite", outputMode: "single_sprite", outputFormat: "png" },
   { label: "Animation Sheet", lane: "sprite", outputMode: "sprite_sheet", outputFormat: "spritesheet_png" },
-  { label: "Iso Sprite", lane: "iso", outputMode: "single_sprite", outputFormat: "png" },
-  { label: "Iso Tile", lane: "iso", outputMode: "tile_iso", outputFormat: "png" },
+  {
+    label: "Iso Sprite",
+    lane: "iso",
+    outputMode: "single_sprite",
+    outputFormat: "png",
+    preferredModelFamilies: ["sdxl_iso_landscape", "sdxl_iso_monsters", "pixel_art_diffusion_xl"],
+  },
+  {
+    label: "Iso Tile",
+    lane: "iso",
+    outputMode: "tile_iso",
+    outputFormat: "png",
+    preferredModelFamilies: ["sdxl_iso_landscape", "sdxl_iso_monsters", "pixel_art_diffusion_xl"],
+  },
   { label: "Tile Chunk", lane: "world", outputMode: "tile_chunk", outputFormat: "png" },
   { label: "UI Module", lane: "ui", outputMode: "ui_module", outputFormat: "png" },
 ];
@@ -114,12 +141,68 @@ const DEFAULT_MODELS: ModelOption[] = [
     id: "pixel_art_diffusion_xl",
     label: "Pixel Art Diffusion XL SpriteShaper (recommended checkpoint)",
     quality: "pixel-checkpoint",
+    recommended_lanes: ["sprite", "world", "prop", "ui", "detail", "atmosphere", "concept"],
   },
-  { id: "sdxl_base", label: "PAD-XL SpriteShaper (active base)", quality: "pixel-checkpoint" },
-  { id: "sdxl_pixel_art", label: "SDXL Base + 64x64 Pixel Art LoRA", quality: "pixel-optimized" },
-  { id: "sdxl_swordsman", label: "SDXL + Swordsman LoRA", quality: "character-optimized" },
-  { id: "sdxl_jinja_shrine", label: "SDXL + Jinja Shrine Zen LoRA", quality: "environment-optimized" },
+  {
+    id: "sdxl_base",
+    label: "PAD-XL SpriteShaper (active base)",
+    quality: "pixel-checkpoint",
+    recommended_lanes: ["sprite", "world", "prop", "ui", "detail", "atmosphere", "concept"],
+  },
+  {
+    id: "sdxl_pixel_art",
+    label: "SDXL Base + 64x64 Pixel Art LoRA",
+    quality: "pixel-optimized",
+    recommended_lanes: ["sprite", "world", "prop"],
+  },
+  {
+    id: "sdxl_iso_landscape",
+    label: "SDXL Base + Isometric Landscape Sprites LoRA",
+    quality: "iso-optimized",
+    recommended_lanes: ["iso"],
+  },
+  {
+    id: "sdxl_iso_monsters",
+    label: "SDXL Base + Isometric Monster Sprites LoRA",
+    quality: "iso-optimized",
+    recommended_lanes: ["iso"],
+  },
+  {
+    id: "sdxl_swordsman",
+    label: "SDXL + Swordsman LoRA",
+    quality: "character-optimized",
+    recommended_lanes: ["sprite", "iso", "portrait", "concept"],
+  },
+  {
+    id: "sdxl_jinja_shrine",
+    label: "SDXL + Jinja Shrine Zen LoRA",
+    quality: "environment-optimized",
+    recommended_lanes: ["world", "iso", "atmosphere", "concept"],
+  },
 ];
+
+function pickQuickStartModel(
+  models: ModelOption[],
+  lane: string,
+  preferredFamilies: string[] | undefined,
+): string | null {
+  if (models.length === 0) {
+    return null;
+  }
+
+  for (const id of preferredFamilies ?? []) {
+    if (models.some((model) => model.id === id)) {
+      return id;
+    }
+  }
+
+  const laneMatched = models.find((model) => model.recommended_lanes?.includes(lane));
+  if (laneMatched) {
+    return laneMatched.id;
+  }
+
+  return models[0]?.id ?? null;
+}
 
 const DEFAULT_ASSET_PRESETS: AssetPreset[] = [
   { id: "sprite", label: "Sprite" },
@@ -175,11 +258,31 @@ type FrameScore = {
   attempts: number;
 };
 
+// ── Post-processing quick presets ───────────────────────────────────────────
+const PP_PRESETS: Record<string, Partial<{
+  ppPixelate: boolean; ppPixelateStrength: number;
+  ppQuantize: boolean; ppCleanup: boolean;
+  ppOutlineStrength: number; ppAntiAliasLevel: number;
+  ppClusterSmoothing: number; ppContrastBoost: number;
+  ppShadowReinforcement: number; ppHighlightReinforcement: number;
+  ppPaletteStrictness: number;
+}>> = {
+  "Off (none)": { ppPixelate: false, ppQuantize: false, ppCleanup: false, ppOutlineStrength: 0, ppAntiAliasLevel: 0, ppClusterSmoothing: 0, ppContrastBoost: 0, ppShadowReinforcement: 0, ppHighlightReinforcement: 0 },
+  "Crisp sprite (16px)": { ppPixelate: true, ppPixelateStrength: 1.0, ppQuantize: true, ppCleanup: true, ppOutlineStrength: 1, ppAntiAliasLevel: 1, ppClusterSmoothing: 1, ppContrastBoost: 0, ppShadowReinforcement: 0, ppHighlightReinforcement: 0, ppPaletteStrictness: 2 },
+  "Crisp sprite (32px)": { ppPixelate: true, ppPixelateStrength: 1.0, ppQuantize: true, ppCleanup: true, ppOutlineStrength: 1, ppAntiAliasLevel: 1, ppClusterSmoothing: 2, ppContrastBoost: 0, ppShadowReinforcement: 0, ppHighlightReinforcement: 0, ppPaletteStrictness: 2 },
+  "Tile production": { ppPixelate: true, ppPixelateStrength: 1.0, ppQuantize: true, ppCleanup: true, ppOutlineStrength: 0, ppAntiAliasLevel: 2, ppClusterSmoothing: 2, ppContrastBoost: 0.1, ppShadowReinforcement: 0.1, ppHighlightReinforcement: 0.1, ppPaletteStrictness: 2 },
+  "Painterly soft": { ppPixelate: false, ppQuantize: false, ppCleanup: false, ppOutlineStrength: 0, ppAntiAliasLevel: 0, ppClusterSmoothing: 0, ppContrastBoost: 0, ppShadowReinforcement: 0, ppHighlightReinforcement: 0 },
+};
+
+// ── All available lanes for library filter ───────────────────────────────────
+const LIBRARY_LANES = ["sprite", "iso", "world", "prop", "ui", "portrait", "detail", "atmosphere"];
+
 type StudioSettings = {
   tab: Tab;
   theme: Theme;
   search: string;
   filter: "all" | "starred";
+  laneFilter: string;
   prompt: string;
   negativePrompt: string;
   lane: string;
@@ -203,6 +306,7 @@ type StudioSettings = {
   tileEdgeSoftening: number;
   ppPixelate: boolean;
   ppPixelateStrength: number;
+  postGenerationPixelateFactor: number;
   ppRemoveBg: boolean;
   ppQuantize: boolean;
   ppCleanup: boolean;
@@ -224,6 +328,9 @@ type StudioSettings = {
   controlStrength: number;
   controlStart: number;
   controlEnd: number;
+  isoDepthGuide: boolean;
+  isoElevation: number;
+  isoAzimuth: number;
   seed: number;
   cfgScale: number;
   enhancePrompt: boolean;
@@ -237,6 +344,11 @@ type StudioSettings = {
   editorGrid: number;
   editorColor: string;
   editorPixels: string[];
+  editorCleanupPixelateFactor: number;
+  editorCleanupColorStep: number;
+  editorCleanupIsolated: boolean;
+  editorCleanupNeighborLimit: number;
+  numVariants: number;
 };
 
 function getAnimationFrameScores(metadata: unknown): FrameScore[] {
@@ -487,6 +599,9 @@ function App() {
 
   const [history, setHistory] = useState<JobRecord[]>(readHistory());
   const [starredIds, setStarredIds] = useState<string[]>(readStarred());
+  const [laneFilter, setLaneFilter] = useState<string>(savedSettings.laneFilter ?? "all");
+  const [variantBatch, setVariantBatch] = useState<JobRecord[]>([]);
+  const [numVariants, setNumVariants] = useState<number>(savedSettings.numVariants ?? 1);
 
   const [search, setSearch] = useState<string>(savedSettings.search ?? "");
   const [filter, setFilter] = useState<"all" | "starred">(savedSettings.filter ?? "all");
@@ -520,6 +635,12 @@ function App() {
   // post-processing – all opt-in, all default off
   const [ppPixelate, setPpPixelate] = useState<boolean>(savedSettings.ppPixelate ?? false);
   const [ppPixelateStrength, setPpPixelateStrength] = useState<number>(savedSettings.ppPixelateStrength ?? 1.0);
+  const [postGenerationPixelateFactor, setPostGenerationPixelateFactor] = useState<number>(
+    savedSettings.postGenerationPixelateFactor ?? 3,
+  );
+  const [postGenerationPixelatedPreviewUrl, setPostGenerationPixelatedPreviewUrl] = useState<string>("");
+  const [postGenerationPixelateBusy, setPostGenerationPixelateBusy] = useState<boolean>(false);
+  const [postGenerationPixelateError, setPostGenerationPixelateError] = useState<string>("");
   const [ppRemoveBg, setPpRemoveBg] = useState<boolean>(savedSettings.ppRemoveBg ?? false);
   const [ppQuantize, setPpQuantize] = useState<boolean>(savedSettings.ppQuantize ?? false);
   const [ppCleanup, setPpCleanup] = useState<boolean>(savedSettings.ppCleanup ?? false);
@@ -574,12 +695,38 @@ function App() {
   const [controlStrength, setControlStrength] = useState<number>(savedSettings.controlStrength ?? 0.5);
   const [controlStart, setControlStart] = useState<number>(savedSettings.controlStart ?? 0);
   const [controlEnd, setControlEnd] = useState<number>(savedSettings.controlEnd ?? 1);
+  // iso camera angle controls
+  const [isoDepthGuide, setIsoDepthGuide] = useState<boolean>(savedSettings.isoDepthGuide ?? false);
+  const [isoElevation, setIsoElevation] = useState<number>(savedSettings.isoElevation ?? 26.565);
+  const [isoAzimuth, setIsoAzimuth] = useState<number>(savedSettings.isoAzimuth ?? 45);
 
   const [editorGrid, setEditorGrid] = useState<number>(savedSettings.editorGrid ?? 24);
   const [editorColor, setEditorColor] = useState<string>(savedSettings.editorColor ?? "#78b0a6");
   const [editorPixels, setEditorPixels] = useState<string[]>(
     savedSettings.editorPixels ?? Array.from({ length: (savedSettings.editorGrid ?? 24) * (savedSettings.editorGrid ?? 24) }, () => ""),
   );
+  const [editorCleanupPixelateFactor, setEditorCleanupPixelateFactor] = useState<number>(
+    savedSettings.editorCleanupPixelateFactor ?? 1.5,
+  );
+  const [editorCleanupColorStep, setEditorCleanupColorStep] = useState<number>(
+    savedSettings.editorCleanupColorStep ?? 16,
+  );
+  const [editorCleanupIsolated, setEditorCleanupIsolated] = useState<boolean>(
+    savedSettings.editorCleanupIsolated ?? true,
+  );
+  const [editorCleanupNeighborLimit, setEditorCleanupNeighborLimit] = useState<number>(
+    savedSettings.editorCleanupNeighborLimit ?? 1,
+  );
+  const [editorImportedImageUrl, setEditorImportedImageUrl] = useState<string>("");
+  const [editorWorkingImageUrl, setEditorWorkingImageUrl] = useState<string>("");
+  const [editorCleanupBusy, setEditorCleanupBusy] = useState<boolean>(false);
+  const [editorCleanupError, setEditorCleanupError] = useState<string>("");
+  // force-resize state
+  const [editorResizeWidth, setEditorResizeWidth] = useState<number>(64);
+  const [editorResizeHeight, setEditorResizeHeight] = useState<number>(64);
+  const [editorResizeTrimAlpha, setEditorResizeTrimAlpha] = useState<boolean>(true);
+  const [editorResizeBusy, setEditorResizeBusy] = useState<boolean>(false);
+  const [editorResizeError, setEditorResizeError] = useState<string>("");
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const editorGridInitializedRef = useRef<boolean>(false);
@@ -686,7 +833,9 @@ function App() {
       return;
     }
     if (modelFamily !== RECOMMENDED_MODEL_ID) {
-      setModelFamily(RECOMMENDED_MODEL_ID);
+      Promise.resolve().then(() => {
+        setModelFamily(RECOMMENDED_MODEL_ID);
+      });
     }
   }, [lockModelSelection, modelFamily]);
 
@@ -740,6 +889,8 @@ function App() {
       theme,
       search,
       filter,
+      laneFilter,
+      numVariants,
       prompt,
       negativePrompt,
       lane,
@@ -763,6 +914,7 @@ function App() {
       tileEdgeSoftening,
       ppPixelate,
       ppPixelateStrength,
+      postGenerationPixelateFactor,
       ppRemoveBg,
       ppQuantize,
       ppCleanup,
@@ -784,6 +936,9 @@ function App() {
       controlStrength,
       controlStart,
       controlEnd,
+      isoDepthGuide,
+      isoElevation,
+      isoAzimuth,
       seed,
       cfgScale,
       enhancePrompt,
@@ -797,6 +952,10 @@ function App() {
       editorGrid,
       editorColor,
       editorPixels,
+      editorCleanupPixelateFactor,
+      editorCleanupColorStep,
+      editorCleanupIsolated,
+      editorCleanupNeighborLimit,
     });
   }, [
     tab,
@@ -826,6 +985,7 @@ function App() {
     tileEdgeSoftening,
     ppPixelate,
     ppPixelateStrength,
+    postGenerationPixelateFactor,
     ppRemoveBg,
     ppQuantize,
     ppCleanup,
@@ -847,6 +1007,9 @@ function App() {
     controlStrength,
     controlStart,
     controlEnd,
+    isoDepthGuide,
+    isoElevation,
+    isoAzimuth,
     seed,
     cfgScale,
     enhancePrompt,
@@ -860,6 +1023,12 @@ function App() {
     editorGrid,
     editorColor,
     editorPixels,
+    editorCleanupPixelateFactor,
+    editorCleanupColorStep,
+    editorCleanupIsolated,
+    editorCleanupNeighborLimit,
+    laneFilter,
+    numVariants,
   ]);
 
   const applyQualityProfile = useCallback((profile: QualityProfile) => {
@@ -936,17 +1105,29 @@ function App() {
   }, []);
 
   useEffect(() => {
+    Promise.resolve().then(() => {
+      setPostGenerationPixelatedPreviewUrl("");
+      setPostGenerationPixelateError("");
+      setPostGenerationPixelateBusy(false);
+    });
+  }, [jobState.result?.download?.png_url, jobState.result?.image_url]);
+
+  useEffect(() => {
     if (!modelsLoaded) {
       return;
     }
     if (models.length === 0) {
       if (modelFamily !== "") {
-        setModelFamily("");
+        Promise.resolve().then(() => {
+          setModelFamily("");
+        });
       }
       return;
     }
     if (!models.some((model) => model.id === modelFamily)) {
-      setModelFamily(models[0]?.id ?? "");
+      Promise.resolve().then(() => {
+        setModelFamily(models[0]?.id ?? "");
+      });
     }
   }, [modelFamily, models, modelsLoaded]);
 
@@ -1036,6 +1217,10 @@ function App() {
     setLane(preset.lane);
     setOutputMode(preset.outputMode);
     setOutputFormat(preset.outputFormat);
+    const selectedModel = pickQuickStartModel(availableModels, preset.lane, preset.preferredModelFamilies);
+    if (selectedModel) {
+      setModelFamily(selectedModel);
+    }
     setPrompt(getStarterPrompt(preset.lane, preset.outputMode));
     setValidationError("");
   }
@@ -1143,6 +1328,9 @@ function App() {
       control_strength: controlStrength,
       control_start: controlStart,
       control_end: controlEnd,
+      iso_depth_guide: isoDepthGuide,
+      iso_elevation: isoElevation,
+      iso_azimuth: isoAzimuth,
       tile_options: {
         tile_size: tileSize,
         seamless_mode: tileSeamless,
@@ -1176,8 +1364,24 @@ function App() {
     };
 
     try {
-      const record = await submitJob(request);
-      setHistory((prev) => [record, ...prev].slice(0, 150));
+      if (numVariants <= 1) {
+        const record = await submitJob(request);
+        setHistory((prev) => [record, ...prev].slice(0, 150));
+        setVariantBatch([]);
+      } else {
+        // Submit N variants in sequence (same prompt+settings, each with seed=-1 for random)
+        setVariantBatch([]);
+        const variantRequest = { ...request, seed: -1 };
+        const batch: JobRecord[] = [];
+        for (let i = 0; i < numVariants; i++) {
+          const record = await submitJob(variantRequest);
+          batch.push(record);
+          setHistory((prev) => [record, ...prev].slice(0, 150));
+          setVariantBatch([...batch]);
+          // Small delay between submissions to avoid overwhelming the queue
+          if (i < numVariants - 1) await new Promise(r => setTimeout(r, 200));
+        }
+      }
     } catch {
       // error already reflected in jobState.errorMessage
     }
@@ -1337,6 +1541,9 @@ function App() {
       if (filter === "starred" && !starredIds.includes(item.job_id)) {
         return false;
       }
+      if (laneFilter !== "all" && item.request.lane !== laneFilter) {
+        return false;
+      }
       if (!needle) {
         return true;
       }
@@ -1347,7 +1554,7 @@ function App() {
         item.request.lane.toLowerCase().includes(needle)
       );
     });
-  }, [history, search, filter, starredIds]);
+  }, [history, search, filter, laneFilter, starredIds]);
 
   function downloadLink(label: string, url?: string) {
     const disabled = !url;
@@ -1412,6 +1619,227 @@ function App() {
         {label}
       </a>
     );
+  }
+
+  const baseGeneratedPreviewUrl =
+    jobState.result?.download?.png_url ?? jobState.result?.image_url;
+  const activeGeneratedPreviewUrl = postGenerationPixelatedPreviewUrl || baseGeneratedPreviewUrl;
+
+  async function applyPostGenerationPixelate() {
+    setPostGenerationPixelateError("");
+    if (!baseGeneratedPreviewUrl) {
+      setPostGenerationPixelateError("Generate an image first, then apply post-generation pixelate.");
+      return;
+    }
+
+    setPostGenerationPixelateBusy(true);
+    try {
+      const pixelated = await pixelateImageToDataUrl(baseGeneratedPreviewUrl, postGenerationPixelateFactor);
+      setPostGenerationPixelatedPreviewUrl(pixelated);
+    } catch {
+      setPostGenerationPixelateError("Could not pixelate the generated image preview.");
+    } finally {
+      setPostGenerationPixelateBusy(false);
+    }
+  }
+
+  function resetPostGenerationPixelate() {
+    setPostGenerationPixelatedPreviewUrl("");
+    setPostGenerationPixelateError("");
+  }
+
+  function downloadPostGenerationPixelatedPng() {
+    if (!postGenerationPixelatedPreviewUrl) {
+      return;
+    }
+    const anchor = document.createElement("a");
+    anchor.href = postGenerationPixelatedPreviewUrl;
+    anchor.download = "pixelated-preview.png";
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+  }
+
+  function sendGeneratedPreviewToEditor() {
+    if (!activeGeneratedPreviewUrl) {
+      setValidationError("Generate an image first, then send it to Pixel Editor.");
+      return;
+    }
+    setEditorImportedImageUrl(activeGeneratedPreviewUrl);
+    setEditorWorkingImageUrl(activeGeneratedPreviewUrl);
+    setEditorCleanupError("");
+    setTab("editor");
+  }
+
+  async function handleEditorImageUpload(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (file.type !== "image/png") {
+      setEditorCleanupError("Pixel Editor import currently supports PNG only.");
+      return;
+    }
+    setEditorCleanupError("");
+    const dataUrl = await fileToDataUrl(file);
+    setEditorImportedImageUrl(dataUrl);
+    setEditorWorkingImageUrl(dataUrl);
+    e.target.value = "";
+  }
+
+  async function applyEditorCleanup() {
+    if (!editorWorkingImageUrl) {
+      setEditorCleanupError("No editor image loaded yet.");
+      return;
+    }
+    setEditorCleanupError("");
+    setEditorCleanupBusy(true);
+    try {
+      const cleaned = await cleanupImageForEditor(editorWorkingImageUrl, {
+        pixelateFactor: editorCleanupPixelateFactor,
+        colorStep: editorCleanupColorStep,
+        removeIsolated: editorCleanupIsolated,
+        maxNeighborsSame: editorCleanupNeighborLimit,
+      });
+      setEditorWorkingImageUrl(cleaned);
+    } catch {
+      setEditorCleanupError("Cleanup failed for this image.");
+    } finally {
+      setEditorCleanupBusy(false);
+    }
+  }
+
+  function resetEditorImportedImage() {
+    if (!editorImportedImageUrl) {
+      return;
+    }
+    setEditorWorkingImageUrl(editorImportedImageUrl);
+    setEditorCleanupError("");
+  }
+
+  function clearEditorImportedImage() {
+    setEditorImportedImageUrl("");
+    setEditorWorkingImageUrl("");
+    setEditorCleanupError("");
+  }
+
+  function exportEditorProcessedImage() {
+    if (!editorWorkingImageUrl) {
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = editorWorkingImageUrl;
+    link.download = "pixel-editor-cleanup.png";
+    link.click();
+  }
+
+  /**
+   * Force-resize the working image to targetW×targetH while preserving subject integrity.
+   *
+   * Pipeline:
+   *  1. Optionally auto-trim transparent borders (keeps the actual sprite subject centred).
+   *  2. Iterative half-resolution bilinear downscale until we reach ≤2× the target
+   *     (reduces aliasing vs. a single large-to-small jump).
+   *  3. Final nearest-neighbor snap to exact target size (correct pixel-art look).
+   *
+   * Result is a PNG data-URL at the requested pixel dimensions.
+   */
+  async function resizeImageForEditor(
+    src: string,
+    targetW: number,
+    targetH: number,
+    trimAlpha: boolean,
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        let srcCanvas = document.createElement("canvas");
+        srcCanvas.width = img.naturalWidth;
+        srcCanvas.height = img.naturalHeight;
+        const srcCtx = srcCanvas.getContext("2d")!;
+        srcCtx.drawImage(img, 0, 0);
+
+        // Step 1: trim transparent border if requested (sprite / prop use-case)
+        if (trimAlpha) {
+          const data = srcCtx.getImageData(0, 0, srcCanvas.width, srcCanvas.height);
+          const px = data.data;
+          let minX = srcCanvas.width, minY = srcCanvas.height, maxX = 0, maxY = 0;
+          for (let y = 0; y < srcCanvas.height; y++) {
+            for (let x = 0; x < srcCanvas.width; x++) {
+              const alpha = px[(y * srcCanvas.width + x) * 4 + 3];
+              if (alpha > 8) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }
+            }
+          }
+          if (maxX > minX && maxY > minY) {
+            const tw = maxX - minX + 1;
+            const th = maxY - minY + 1;
+            const trimmed = document.createElement("canvas");
+            trimmed.width = tw;
+            trimmed.height = th;
+            trimmed.getContext("2d")!.drawImage(srcCanvas, minX, minY, tw, th, 0, 0, tw, th);
+            srcCanvas = trimmed;
+          }
+        }
+
+        // Step 2: iterative bilinear halving until ≤2× target
+        let cur = srcCanvas;
+        while (cur.width > targetW * 2 || cur.height > targetH * 2) {
+          const hw = Math.max(targetW, Math.round(cur.width / 2));
+          const hh = Math.max(targetH, Math.round(cur.height / 2));
+          const half = document.createElement("canvas");
+          half.width = hw;
+          half.height = hh;
+          const hCtx = half.getContext("2d")!;
+          hCtx.imageSmoothingEnabled = true;
+          hCtx.imageSmoothingQuality = "high";
+          hCtx.drawImage(cur, 0, 0, hw, hh);
+          cur = half;
+        }
+
+        // Step 3: final snap to exact target with nearest-neighbor (pixel-art look)
+        const out = document.createElement("canvas");
+        out.width = targetW;
+        out.height = targetH;
+        const outCtx = out.getContext("2d")!;
+        outCtx.imageSmoothingEnabled = false;
+        outCtx.drawImage(cur, 0, 0, targetW, targetH);
+
+        resolve(out.toDataURL("image/png"));
+      };
+      img.onerror = () => reject(new Error("Failed to load image for resize"));
+      img.src = src;
+    });
+  }
+
+  async function applyEditorResize() {
+    if (!editorWorkingImageUrl) {
+      setEditorResizeError("No editor image loaded yet.");
+      return;
+    }
+    if (editorResizeWidth < 1 || editorResizeHeight < 1) {
+      setEditorResizeError("Target size must be at least 1×1.");
+      return;
+    }
+    setEditorResizeError("");
+    setEditorResizeBusy(true);
+    try {
+      const resized = await resizeImageForEditor(
+        editorWorkingImageUrl,
+        editorResizeWidth,
+        editorResizeHeight,
+        editorResizeTrimAlpha,
+      );
+      setEditorWorkingImageUrl(resized);
+    } catch {
+      setEditorResizeError("Resize failed.");
+    } finally {
+      setEditorResizeBusy(false);
+    }
   }
 
   return (
@@ -1538,7 +1966,47 @@ function App() {
                   <option value="portrait">Portrait</option>
                 </select>
               </label>
+            </div>
 
+            {lane === "iso" && (
+              <div className="iso-angle-panel">
+                <p className="panel-subtitle">Iso Camera Angle</p>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={isoDepthGuide}
+                    onChange={(e) => setIsoDepthGuide(e.target.checked)}
+                  />
+                  Use synthetic depth guide (locks camera via ControlNet — no source image needed)
+                </label>
+                <label>
+                  Elevation: {isoElevation.toFixed(1)}° {isoElevation > 26 && isoElevation < 27.5 ? "(classic 2:1 dimetric)" : ""}
+                  <input
+                    type="range"
+                    min={10}
+                    max={60}
+                    step={0.5}
+                    value={isoElevation}
+                    onChange={(e) => setIsoElevation(parseFloat(e.target.value))}
+                  />
+                </label>
+                <label>
+                  Azimuth (camera direction)
+                  <select value={isoAzimuth} onChange={(e) => setIsoAzimuth(parseFloat(e.target.value))}>
+                    <option value={45}>45° — NE facing (SNES/GBA standard)</option>
+                    <option value={135}>135° — SE facing</option>
+                    <option value={225}>225° — SW facing</option>
+                    <option value={315}>315° — NW facing</option>
+                    <option value={0}>0° — North (custom)</option>
+                    <option value={90}>90° — East (custom)</option>
+                    <option value={180}>180° — South (custom)</option>
+                    <option value={270}>270° — West (custom)</option>
+                  </select>
+                </label>
+              </div>
+            )}
+
+            <div className="inline-grid three">
               <label>
                 Output mode
                 <select value={outputMode} onChange={(e) => setOutputMode(e.target.value)}>
@@ -1564,9 +2032,20 @@ function App() {
             </div>
 
             <div className="submit-dock" role="region" aria-label="Primary action">
-              <button className="submit submit-primary" onClick={handleSubmitJob} disabled={!hasAvailableModels}>
-                Submit Generation
-              </button>
+              <div className="variant-row">
+                <button className="submit submit-primary" onClick={handleSubmitJob} disabled={!hasAvailableModels}>
+                  {numVariants > 1 ? `Generate ${numVariants} variants` : "Submit Generation"}
+                </button>
+                <div className="variant-count-group" title="How many variants to generate in one click">
+                  {[1, 2, 4, 6].map((n) => (
+                    <button
+                      key={n}
+                      className={`variant-pill${numVariants === n ? " active" : ""}`}
+                      onClick={() => setNumVariants(n)}
+                    >{n}</button>
+                  ))}
+                </div>
+              </div>
               <p className="muted">Core settings above. Advanced settings can be expanded below when needed.</p>
             </div>
 
@@ -1910,6 +2389,30 @@ function App() {
               <p className="muted">
                 All steps are opt-in. Leave all off if the image already looks right – you can always re-generate.
               </p>
+              <div className="pp-preset-row">
+                <select
+                  defaultValue=""
+                  onChange={(e) => {
+                    const preset = PP_PRESETS[e.target.value];
+                    if (!preset) return;
+                    if (preset.ppPixelate !== undefined) setPpPixelate(preset.ppPixelate);
+                    if (preset.ppPixelateStrength !== undefined) setPpPixelateStrength(preset.ppPixelateStrength);
+                    if (preset.ppQuantize !== undefined) setPpQuantize(preset.ppQuantize);
+                    if (preset.ppCleanup !== undefined) setPpCleanup(preset.ppCleanup);
+                    if (preset.ppOutlineStrength !== undefined) setPpOutlineStrength(preset.ppOutlineStrength);
+                    if (preset.ppAntiAliasLevel !== undefined) setPpAntiAliasLevel(preset.ppAntiAliasLevel);
+                    if (preset.ppClusterSmoothing !== undefined) setPpClusterSmoothing(preset.ppClusterSmoothing);
+                    if (preset.ppContrastBoost !== undefined) setPpContrastBoost(preset.ppContrastBoost);
+                    if (preset.ppShadowReinforcement !== undefined) setPpShadowReinforcement(preset.ppShadowReinforcement);
+                    if (preset.ppHighlightReinforcement !== undefined) setPpHighlightReinforcement(preset.ppHighlightReinforcement);
+                    if (preset.ppPaletteStrictness !== undefined) setPpPaletteStrictness(preset.ppPaletteStrictness);
+                    e.target.value = "";
+                  }}
+                >
+                  <option value="" disabled>Load preset…</option>
+                  {Object.keys(PP_PRESETS).map((name) => <option key={name} value={name}>{name}</option>)}
+                </select>
+              </div>
               <label className="checkbox-row">
                 <input type="checkbox" checked={ppPixelate} onChange={(e) => setPpPixelate(e.target.checked)} />
                 <span>
@@ -2121,17 +2624,26 @@ function App() {
                   </label>
                 </>
               )}
-              <label className="field-row">
-                <span>Seed (-1 = random)</span>
-                <input
-                  type="number"
-                  min={-1}
-                  max={4294967295}
-                  value={seed}
-                  onChange={(e) => setSeed(parseInt(e.target.value, 10) || -1)}
-                  style={{ width: "140px" }}
-                />
-              </label>
+              <div className="seed-row">
+                <label className="field-row" style={{ flex: 1 }}>
+                  <span>Seed {seed !== -1 ? <span className="seed-locked-badge">🔒 Locked</span> : "(random)"}</span>
+                  <input
+                    type="number"
+                    min={-1}
+                    max={4294967295}
+                    value={seed}
+                    onChange={(e) => setSeed(parseInt(e.target.value, 10) || -1)}
+                    style={{ width: "140px" }}
+                  />
+                </label>
+                {seed !== -1 && (
+                  <button
+                    className="seed-reroll-btn"
+                    title="Clear seed — next run will use a random seed"
+                    onClick={() => setSeed(-1)}
+                  >🎲 Re-roll</button>
+                )}
+              </div>
               <label className="field-row">
                 <span>CFG Scale ({cfgScale.toFixed(1)})</span>
                 <input
@@ -2198,11 +2710,70 @@ function App() {
 
             <div className="preview-card">
               <p className="status-label">Preview</p>
-              {jobState.result?.download?.png_url ? (
-                <img src={jobState.result.download.png_url} alt="Generated preview" />
+              {activeGeneratedPreviewUrl ? (
+                <img src={activeGeneratedPreviewUrl} alt="Generated preview" />
               ) : (
                 <div className="empty-preview">Generated preview appears here.</div>
               )}
+              {activeGeneratedPreviewUrl && (outputMode.includes("tile") || outputMode === "tile_chunk" || outputMode === "tile_iso") && (
+                <details className="seam-preview-details">
+                  <summary className="seam-preview-toggle">Tile seam preview (3×3 repeat)</summary>
+                  <div className="seam-grid">
+                    {Array.from({ length: 9 }).map((_, i) => (
+                      <img key={i} src={activeGeneratedPreviewUrl} alt="" className="seam-cell" />
+                    ))}
+                  </div>
+                </details>
+              )}
+            </div>
+
+            <div className="post-pixelate-card">
+              <p className="status-label">Post-generation pixelate</p>
+              <p className="muted">
+                Apply pixelate after generation when you want to tighten pixel edges without re-running the model.
+              </p>
+              <label className="slider-row">
+                <span>Pixel factor ({postGenerationPixelateFactor.toFixed(1)}x)</span>
+                <input
+                  type="range"
+                  min={1}
+                  max={8}
+                  step={0.5}
+                  value={postGenerationPixelateFactor}
+                  onChange={(e) => setPostGenerationPixelateFactor(parseFloat(e.target.value))}
+                />
+              </label>
+              <div className="download-grid">
+                <button
+                  type="button"
+                  onClick={applyPostGenerationPixelate}
+                  disabled={!baseGeneratedPreviewUrl || postGenerationPixelateBusy}
+                >
+                  {postGenerationPixelateBusy ? "Applying..." : "Apply pixelate"}
+                </button>
+                <button
+                  type="button"
+                  onClick={resetPostGenerationPixelate}
+                  disabled={!postGenerationPixelatedPreviewUrl || postGenerationPixelateBusy}
+                >
+                  Reset to original
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadPostGenerationPixelatedPng}
+                  disabled={!postGenerationPixelatedPreviewUrl || postGenerationPixelateBusy}
+                >
+                  Download pixelated PNG
+                </button>
+                <button
+                  type="button"
+                  onClick={sendGeneratedPreviewToEditor}
+                  disabled={!activeGeneratedPreviewUrl || postGenerationPixelateBusy}
+                >
+                  Open in Pixel Editor
+                </button>
+              </div>
+              {postGenerationPixelateError && <p className="error">{postGenerationPixelateError}</p>}
             </div>
 
             <div className="downloads-card">
@@ -2290,7 +2861,7 @@ function App() {
                     title="Lock this seed to reproduce the image"
                     onClick={() => setSeed(jobState.result!.seed!)}
                   >
-                    Lock seed
+                    🔒 Lock seed
                   </button>
                 </p>
                 {jobState.result.enhanced_prompt && (
@@ -2299,6 +2870,36 @@ function App() {
                     <p className="enhanced-prompt">{jobState.result.enhanced_prompt}</p>
                   </>
                 )}
+              </div>
+            )}
+
+            {variantBatch.length > 1 && (
+              <div className="variant-batch-card">
+                <p className="status-label">Variant batch ({variantBatch.length})</p>
+                <div className="variant-batch-grid">
+                  {variantBatch.map((item) => {
+                    const imgUrl = item.result?.download?.png_url || item.result?.image_url;
+                    const itemSeed = item.result?.seed;
+                    return (
+                      <div key={item.job_id} className="variant-cell">
+                        {imgUrl ? (
+                          <img src={imgUrl} alt={`Variant ${item.job_id}`} />
+                        ) : (
+                          <div className="variant-pending">{item.status}</div>
+                        )}
+                        <div className="variant-actions">
+                          {itemSeed != null && (
+                            <button
+                              className="variant-use-btn"
+                              title="Lock this seed and use these settings"
+                              onClick={() => setSeed(itemSeed)}
+                            >🔒 Use seed {itemSeed}</button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </section>
@@ -2323,6 +2924,12 @@ function App() {
                   Starred
                 </button>
                 <button onClick={clearLibrary}>Clear all</button>
+              </div>
+              <div className="filter-pills lane-filter-pills">
+                <button className={laneFilter === "all" ? "active" : ""} onClick={() => setLaneFilter("all")}>All lanes</button>
+                {LIBRARY_LANES.map((l) => (
+                  <button key={l} className={laneFilter === l ? "active" : ""} onClick={() => setLaneFilter(l)}>{l}</button>
+                ))}
               </div>
             </div>
 
@@ -2360,6 +2967,144 @@ function App() {
           <section className="panel editor-panel">
             <h2>Pixel Editor</h2>
             <p className="muted">Beta - quick cleanup and blocking sketch tool.</p>
+
+            <div className="editor-import-row">
+              <label className="editor-upload-label">
+                Import PNG to Editor
+                <input type="file" accept="image/png" onChange={handleEditorImageUpload} style={{ display: "none" }} />
+              </label>
+              <button type="button" onClick={clearEditorImportedImage} disabled={!editorWorkingImageUrl || editorCleanupBusy}>
+                Remove imported image
+              </button>
+            </div>
+
+            {editorWorkingImageUrl && (
+              <div className="editor-imported-section">
+                <p className="status-label">Imported image cleanup</p>
+                <img className="editor-imported-preview" src={editorWorkingImageUrl} alt="Editor imported preview" />
+                <div className="editor-cleanup-tools">
+                  <label className="slider-row">
+                    <span>Pixelate factor ({editorCleanupPixelateFactor.toFixed(1)}x)</span>
+                    <input
+                      type="range"
+                      min={1}
+                      max={8}
+                      step={0.5}
+                      value={editorCleanupPixelateFactor}
+                      onChange={(e) => setEditorCleanupPixelateFactor(parseFloat(e.target.value))}
+                    />
+                  </label>
+                  <label className="slider-row">
+                    <span>Color simplify step ({editorCleanupColorStep})</span>
+                    <input
+                      type="range"
+                      min={1}
+                      max={64}
+                      step={1}
+                      value={editorCleanupColorStep}
+                      onChange={(e) => setEditorCleanupColorStep(parseInt(e.target.value, 10) || 1)}
+                    />
+                  </label>
+                  <label className="checkbox-row">
+                    <input
+                      type="checkbox"
+                      checked={editorCleanupIsolated}
+                      onChange={(e) => setEditorCleanupIsolated(e.target.checked)}
+                    />
+                    <span>
+                      <strong>Remove isolated pixels</strong> - smooth one-off noisy pixels by neighbour majority
+                    </span>
+                  </label>
+                  {editorCleanupIsolated && (
+                    <label className="slider-row">
+                      <span>Isolation threshold ({editorCleanupNeighborLimit})</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={2}
+                        step={1}
+                        value={editorCleanupNeighborLimit}
+                        onChange={(e) => setEditorCleanupNeighborLimit(parseInt(e.target.value, 10) || 0)}
+                      />
+                    </label>
+                  )}
+                </div>
+                <div className="download-grid">
+                  <button type="button" onClick={applyEditorCleanup} disabled={editorCleanupBusy}>
+                    {editorCleanupBusy ? "Applying cleanup..." : "Apply cleanup"}
+                  </button>
+                  <button type="button" onClick={resetEditorImportedImage} disabled={editorCleanupBusy}>
+                    Reset imported image
+                  </button>
+                  <button type="button" onClick={exportEditorProcessedImage} disabled={editorCleanupBusy}>
+                    Export cleaned PNG
+                  </button>
+                </div>
+                {editorCleanupError && <p className="error">{editorCleanupError}</p>}
+              </div>
+            )}
+
+            {editorWorkingImageUrl && (
+              <div className="editor-resize-panel">
+                <p className="panel-subtitle">Force resize</p>
+                <p className="panel-hint">
+                  Trim transparent borders, then downscale to target size preserving subject integrity.
+                  Uses iterative bilinear halving + nearest-neighbor snap for clean pixel-art output.
+                </p>
+                <div className="editor-resize-presets">
+                  {[16, 32, 48, 64, 96, 128, 256].map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className={editorResizeWidth === s && editorResizeHeight === s ? "active" : ""}
+                      onClick={() => { setEditorResizeWidth(s); setEditorResizeHeight(s); }}
+                    >
+                      {s}×{s}
+                    </button>
+                  ))}
+                </div>
+                <div className="editor-resize-custom">
+                  <label>
+                    W
+                    <input
+                      type="number"
+                      min={1}
+                      max={4096}
+                      value={editorResizeWidth}
+                      onChange={(e) => setEditorResizeWidth(Math.max(1, Number(e.target.value)))}
+                    />
+                  </label>
+                  <label>
+                    H
+                    <input
+                      type="number"
+                      min={1}
+                      max={4096}
+                      value={editorResizeHeight}
+                      onChange={(e) => setEditorResizeHeight(Math.max(1, Number(e.target.value)))}
+                    />
+                  </label>
+                  <label className="editor-resize-trim-label">
+                    <input
+                      type="checkbox"
+                      checked={editorResizeTrimAlpha}
+                      onChange={(e) => setEditorResizeTrimAlpha(e.target.checked)}
+                    />
+                    Auto-trim transparent border
+                  </label>
+                </div>
+                <div className="download-grid">
+                  <button
+                    type="button"
+                    onClick={applyEditorResize}
+                    disabled={editorResizeBusy}
+                  >
+                    {editorResizeBusy ? "Resizing…" : `Resize to ${editorResizeWidth}×${editorResizeHeight}`}
+                  </button>
+                </div>
+                {editorResizeError && <p className="error">{editorResizeError}</p>}
+              </div>
+            )}
 
             <div className="editor-controls">
               <label>
@@ -2412,10 +3157,177 @@ async function fileToDataUrl(file: File): Promise<string> {
 async function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    if (!/^data:|^blob:/i.test(src)) {
+      img.crossOrigin = "anonymous";
+    }
     img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = src;
   });
+}
+
+async function pixelateImageToDataUrl(src: string, factor: number): Promise<string> {
+  const image = await loadImage(src);
+  const safeFactor = Math.max(1, Math.min(8, factor));
+  const downW = Math.max(1, Math.floor(image.width / safeFactor));
+  const downH = Math.max(1, Math.floor(image.height / safeFactor));
+
+  const downscaled = document.createElement("canvas");
+  downscaled.width = downW;
+  downscaled.height = downH;
+  const downCtx = downscaled.getContext("2d");
+  if (!downCtx) {
+    throw new Error("Could not create downscale canvas context");
+  }
+  downCtx.imageSmoothingEnabled = false;
+  downCtx.drawImage(image, 0, 0, downW, downH);
+
+  const upscaled = document.createElement("canvas");
+  upscaled.width = image.width;
+  upscaled.height = image.height;
+  const upCtx = upscaled.getContext("2d");
+  if (!upCtx) {
+    throw new Error("Could not create upscale canvas context");
+  }
+  upCtx.imageSmoothingEnabled = false;
+  upCtx.drawImage(downscaled, 0, 0, image.width, image.height);
+
+  return upscaled.toDataURL("image/png");
+}
+
+type EditorCleanupOptions = {
+  pixelateFactor: number;
+  colorStep: number;
+  removeIsolated: boolean;
+  maxNeighborsSame: number;
+};
+
+function removeIsolatedPixelsInPlace(data: Uint8ClampedArray, width: number, height: number, maxNeighborsSame: number): void {
+  const source = new Uint8ClampedArray(data);
+  const index = (x: number, y: number) => (y * width + x) * 4;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const i = index(x, y);
+      const alpha = source[i + 3];
+      if (alpha < 32) {
+        continue;
+      }
+
+      const r = source[i];
+      const g = source[i + 1];
+      const b = source[i + 2];
+      let sameCount = 0;
+      const neighbors: Array<{ r: number; g: number; b: number; a: number }> = [];
+      const coords = [
+        [x, y - 1],
+        [x + 1, y],
+        [x, y + 1],
+        [x - 1, y],
+      ];
+
+      for (const [nx, ny] of coords) {
+        const ni = index(nx, ny);
+        const na = source[ni + 3];
+        if (na < 32) {
+          continue;
+        }
+        const nr = source[ni];
+        const ng = source[ni + 1];
+        const nb = source[ni + 2];
+        neighbors.push({ r: nr, g: ng, b: nb, a: na });
+        if (nr === r && ng === g && nb === b) {
+          sameCount += 1;
+        }
+      }
+
+      if (neighbors.length === 0 || sameCount > maxNeighborsSame) {
+        continue;
+      }
+
+      const bucket = new Map<string, { count: number; color: { r: number; g: number; b: number; a: number } }>();
+      for (const n of neighbors) {
+        const key = `${n.r},${n.g},${n.b},${n.a}`;
+        const entry = bucket.get(key);
+        if (entry) {
+          entry.count += 1;
+        } else {
+          bucket.set(key, { count: 1, color: n });
+        }
+      }
+
+      let winner: { r: number; g: number; b: number; a: number } | null = null;
+      let winnerCount = -1;
+      for (const entry of bucket.values()) {
+        if (entry.count > winnerCount) {
+          winner = entry.color;
+          winnerCount = entry.count;
+        }
+      }
+
+      if (!winner) {
+        continue;
+      }
+
+      data[i] = winner.r;
+      data[i + 1] = winner.g;
+      data[i + 2] = winner.b;
+      data[i + 3] = winner.a;
+    }
+  }
+}
+
+async function cleanupImageForEditor(src: string, options: EditorCleanupOptions): Promise<string> {
+  const image = await loadImage(src);
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    throw new Error("Could not create cleanup canvas context");
+  }
+
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(image, 0, 0, image.width, image.height);
+
+  if (options.pixelateFactor > 1.01) {
+    const downW = Math.max(1, Math.floor(image.width / options.pixelateFactor));
+    const downH = Math.max(1, Math.floor(image.height / options.pixelateFactor));
+    const temp = document.createElement("canvas");
+    temp.width = downW;
+    temp.height = downH;
+    const tempCtx = temp.getContext("2d");
+    if (!tempCtx) {
+      throw new Error("Could not create temp cleanup canvas context");
+    }
+    tempCtx.imageSmoothingEnabled = false;
+    tempCtx.drawImage(canvas, 0, 0, downW, downH);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(temp, 0, 0, canvas.width, canvas.height);
+  }
+
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  const step = Math.max(1, options.colorStep);
+
+  if (step > 1) {
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] < 16) {
+        continue;
+      }
+      data[i] = clamp255(Math.round(data[i] / step) * step);
+      data[i + 1] = clamp255(Math.round(data[i + 1] / step) * step);
+      data[i + 2] = clamp255(Math.round(data[i + 2] / step) * step);
+    }
+  }
+
+  if (options.removeIsolated) {
+    removeIsolatedPixelsInPlace(data, canvas.width, canvas.height, options.maxNeighborsSame);
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 function clamp255(value: number): number {

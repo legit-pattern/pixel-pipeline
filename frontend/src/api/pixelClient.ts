@@ -9,6 +9,7 @@ export type ModelOption = {
   id: string;
   label: string;
   quality?: string;
+  recommended_lanes?: string[];
 };
 
 export type AssetPreset = {
@@ -174,6 +175,12 @@ export type GenerateRequest = {
   control_start?: number;
   /** Fraction of denoising timeline where control ends. */
   control_end?: number;
+  /** When true + lane=iso: generate a synthetic depth map guide (no source image needed). */
+  iso_depth_guide?: boolean;
+  /** Elevation angle in degrees for synthetic iso depth guide. 26.565 = classic 2:1 dimetric. */
+  iso_elevation?: number;
+  /** Azimuth angle in degrees. 45=NE (standard SNES/GBA), 135=SE, 225=SW, 315=NW. */
+  iso_azimuth?: number;
 };
 
 export type JobResult = {
