@@ -46,3 +46,16 @@ trace.json
 /LibreSprite
 /pixel_output
 /scripts/bin
+
+# Local copilot skill experiments and asset planning drafts
+/.github/skills/controlnet-stack-integration/
+/.github/skills/hd2d-polish-pass/
+/.github/skills/iso-lane-foundation/
+/.github/skills/pixel-model-ops/
+/.github/skills/pixel-stack-benchmarking/
+/.github/skills/post-processing-calibration/
+/asset-roadmap/
+/docs/pixel-studio/FRONTEND_USER_PATTERN_MAP.md
+
+# Local package cache
+/pip-cache/
